@@ -223,6 +223,11 @@ class VirtualGPU : public device::VirtualDevice {
 
   class HwQueueTracker : public amd::EmbeddedObject {
    public:
+    struct EngineSignalChain {
+      std::vector<ProfilingSignal*> signals;
+      size_t current_id = 0;
+    };
+
     HwQueueTracker(const VirtualGPU& gpu): gpu_(gpu) {}
 
     ~HwQueueTracker();
@@ -234,9 +239,10 @@ class VirtualGPU : public device::VirtualDevice {
     hsa_signal_t ActiveSignal(hsa_signal_value_t init_val = kInitSignalValueOne,
                               Timestamp* ts = nullptr, bool forceHostWait = true);
 
-    //! Wait for the curent active signal. Can idle the queue
-    bool WaitCurrent() {
-      ProfilingSignal* signal = signal_list_[current_id_];
+    //! Wait for the curent active signal on the specified engine chain
+    bool WaitCurrent(HwQueueEngine engine = HwQueueEngine::Compute) {
+      auto& chain = ChainForEngine(engine);
+      ProfilingSignal* signal = chain.signals[chain.current_id];
       return CpuWaitForSignal(signal);
     }
 
@@ -256,7 +262,10 @@ class VirtualGPU : public device::VirtualDevice {
     }
 
     //! Get the last active signal on the queue
-    ProfilingSignal* GetLastSignal() const { return signal_list_[current_id_]; }
+    ProfilingSignal* GetLastSignal() const {
+      auto& chain = const_cast<HwQueueTracker*>(this)->ActiveChain();
+      return chain.signals[chain.current_id];
+    }
 
     //! Clear external signals
     void ClearExternalSignals() { external_signals_.clear(); }
@@ -270,11 +279,19 @@ class VirtualGPU : public device::VirtualDevice {
       sdma_profiling_ = profile;
       hsa_amd_profiling_async_copy_enable(profile);
     }
+
+    EngineSignalChain& ActiveChain() { return ChainForEngine(engine_); }
+    EngineSignalChain& ChainForEngine(HwQueueEngine e) {
+      return IsSdmaEngine(e) ? sdma_chain_ : compute_chain_;
+    }
+    bool CpuWaitForSignalPublic(ProfilingSignal* s) { return CpuWaitForSignal(s); }
+
   private:
     //! Wait for the next active signal
-    void WaitNext() {
-      size_t next = (current_id_ + 1) % signal_list_.size();
-      ProfilingSignal* signal = signal_list_[next];
+    void WaitNext(HwQueueEngine engine = HwQueueEngine::Compute) {
+      auto& chain = ChainForEngine(engine);
+      size_t next = (chain.current_id + 1) % chain.signals.size();
+      ProfilingSignal* signal = chain.signals[next];
       CpuWaitForSignal(signal);
     }
 
@@ -282,8 +299,8 @@ class VirtualGPU : public device::VirtualDevice {
     bool CpuWaitForSignal(ProfilingSignal* signal);
 
     HwQueueEngine engine_ = HwQueueEngine::Unknown; //!< Engine used in the current operations
-    std::vector<ProfilingSignal*> signal_list_;     //!< The pool of all signals for processing
-    size_t current_id_ = 0;       //!< Last submitted signal
+    EngineSignalChain compute_chain_;                //!< Signal chain for compute engine
+    EngineSignalChain sdma_chain_;                   //!< Signal chain for SDMA engines
     bool sdma_profiling_ = false; //!< If TRUE, then SDMA profiling is enabled
     const VirtualGPU& gpu_;       //!< VirtualGPU, associated with this tracker
     std::vector<ProfilingSignal*> external_signals_; //!< External signals for a wait in this queue

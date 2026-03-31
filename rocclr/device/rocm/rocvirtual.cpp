@@ -353,44 +353,55 @@ void VirtualGPU::MemoryDependency::clear(bool all) {
 }
 
 // ================================================================================================
-VirtualGPU::HwQueueTracker::~HwQueueTracker() {
-  for (auto& signal: signal_list_) {
-    CpuWaitForSignal(signal);
+static void DestroyChain(VirtualGPU::HwQueueTracker& tracker,
+                         VirtualGPU::HwQueueTracker::EngineSignalChain& chain) {
+  for (auto& signal : chain.signals) {
+    tracker.CpuWaitForSignalPublic(signal);
     signal->release();
   }
+}
+
+VirtualGPU::HwQueueTracker::~HwQueueTracker() {
+  DestroyChain(*this, compute_chain_);
+  DestroyChain(*this, sdma_chain_);
 }
 
 // ================================================================================================
 bool VirtualGPU::HwQueueTracker::Create() {
   uint kSignalListSize = ROC_SIGNAL_POOL_SIZE;
 
-  signal_list_.resize(kSignalListSize);
-
   hsa_agent_t agent = gpu_.gpu_device();
   const Settings& settings = gpu_.dev().settings();
   hsa_agent_t* agents = (settings.system_scope_signal_) ? nullptr : &agent;
   uint32_t num_agents = (settings.system_scope_signal_) ? 0 : 1;
 
-  for (uint i = 0; i < kSignalListSize; ++i) {
-    std::unique_ptr<ProfilingSignal> signal(new ProfilingSignal());
-    if ((signal == nullptr) ||
-        (HSA_STATUS_SUCCESS != hsa_signal_create(0, num_agents, agents, &signal->signal_))) {
-      return false;
+  auto initChain = [&](EngineSignalChain& chain, uint size) -> bool {
+    chain.signals.resize(size);
+    for (uint i = 0; i < size; ++i) {
+      std::unique_ptr<ProfilingSignal> signal(new ProfilingSignal());
+      if ((signal == nullptr) ||
+          (HSA_STATUS_SUCCESS != hsa_signal_create(0, num_agents, agents, &signal->signal_))) {
+        return false;
+      }
+      chain.signals[i] = signal.release();
     }
-    signal_list_[i] = signal.release();
-  }
+    return true;
+  };
+  if (!initChain(compute_chain_, kSignalListSize)) return false;
+  if (!initChain(sdma_chain_, kSignalListSize)) return false;
   return true;
 }
 
 // ================================================================================================
 hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
     hsa_signal_value_t init_val, Timestamp* ts, bool forceHostWait) {
+  auto& chain = ActiveChain();
+  auto& signal_list = chain.signals;
+  auto& current_id = chain.current_id;
   bool new_signal = false;
 
-  // Peep signal +2 ahead to see if its done
-  auto temp_id = (current_id_ + 2) % signal_list_.size();
-  // If GPU is still busy with processing, then add more signals to avoid more frequent stalls
-  if (hsa_signal_load_relaxed(signal_list_[temp_id]->signal_) > 0) {
+  auto temp_id = (current_id + 2) % signal_list.size();
+  if (hsa_signal_load_relaxed(signal_list[temp_id]->signal_) > 0) {
     std::unique_ptr<ProfilingSignal> signal(new ProfilingSignal());
     if (signal != nullptr) {
       hsa_agent_t agent = gpu_.gpu_device();
@@ -399,32 +410,20 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
       uint32_t num_agents = (settings.system_scope_signal_) ? 0 : 1;
 
       if (HSA_STATUS_SUCCESS == hsa_signal_create(0, num_agents, agents, &signal->signal_)) {
-        // Find valid new index
-        ++current_id_ %= signal_list_.size();
-        // Insert the new signal into the current slot and ignore any wait
-        signal_list_.insert(signal_list_.begin() + current_id_, signal.release());
+        ++current_id %= signal_list.size();
+        signal_list.insert(signal_list.begin() + current_id, signal.release());
         new_signal = true;
       }
     }
   }
 
-  // If it's the new signal, then the wait can be avoided.
-  // That will allow to grow the list of signals without stalls
   if (!new_signal) {
-    // Find valid index
-    ++current_id_ %= signal_list_.size();
-
-    // Make sure the previous operation on the current signal is done
-    WaitCurrent();
-
-    // Have to wait the next signal in the queue to avoid a race condition between
-    // a GPU waiter(which may be not triggered yet) and CPU signal reset below
-    WaitNext();
+    ++current_id %= signal_list.size();
+    WaitCurrent(engine_);
+    WaitNext(engine_);
   }
 
-  if (signal_list_[current_id_]->referenceCount() > 1) {
-    // The signal was assigned to the global marker's event, hence runtime can't reuse it
-    // and needs a new signal
+  if (signal_list[current_id]->referenceCount() > 1) {
     std::unique_ptr<ProfilingSignal> signal(new ProfilingSignal());
     if (signal != nullptr) {
       hsa_agent_t agent = gpu_.gpu_device();
@@ -433,8 +432,8 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
       uint32_t num_agents = (settings.system_scope_signal_) ? 0 : 1;
 
       if (HSA_STATUS_SUCCESS == hsa_signal_create(0, num_agents, agents, &signal->signal_)) {
-        signal_list_[current_id_]->release();
-        signal_list_[current_id_] = signal.release();
+        signal_list[current_id]->release();
+        signal_list[current_id] = signal.release();
       } else {
         assert(!"ProfilingSignal reallocation failed! Marker has a conflict with signal reuse!");
       }
@@ -442,7 +441,7 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
       assert(!"ProfilingSignal reallocation failed! Marker has a conflict with signal reuse!");
     }
   }
-  ProfilingSignal* prof_signal = signal_list_[current_id_];
+  ProfilingSignal* prof_signal = signal_list[current_id];
   // Reset the signal and return
   hsa_signal_silent_store_relaxed(prof_signal->signal_, init_val);
   prof_signal->flags_.done_ = false;
@@ -495,21 +494,16 @@ hsa_signal_t VirtualGPU::HwQueueTracker::ActiveSignal(
 // ================================================================================================
 std::vector<hsa_signal_t>& VirtualGPU::HwQueueTracker::WaitingSignal(HwQueueEngine engine) {
   bool explicit_wait = false;
-  // Reset all current waiting signals
   waiting_signals_.clear();
 
-  // Does runtime switch the active engine?
+  HwQueueEngine prev_engine = engine_;
   if (engine != engine_) {
-    // Yes, return the signal from the previous operation for a wait
     engine_ = engine;
     explicit_wait = true;
   } else {
-    // Unknown engine in use, hence return a wait signal always
     if (engine == HwQueueEngine::Unknown) {
       explicit_wait = true;
     } else {
-      // Check if skip wait optimization is enabled. It will try to predict the same engine in ROCr
-      // and ignore the signal wait, relying on in-order engine execution
       const Settings& settings = gpu_.dev().settings();
       if (engine != HwQueueEngine::Compute) {
         explicit_wait = true;
@@ -517,20 +511,18 @@ std::vector<hsa_signal_t>& VirtualGPU::HwQueueTracker::WaitingSignal(HwQueueEngi
     }
   }
 
-  // Check if a wait is required
   if (explicit_wait) {
+    auto& prev_chain = ChainForEngine(prev_engine);
+    auto* prev_signal = prev_chain.signals[prev_chain.current_id];
     bool skip_internal_signal = false;
 
     for (uint32_t i = 0; i < external_signals_.size(); ++i) {
-      // If external signal matches internal one, then skip it
-      if (external_signals_[i]->signal_.handle ==
-          signal_list_[current_id_]->signal_.handle) {
+      if (external_signals_[i]->signal_.handle == prev_signal->signal_.handle) {
         skip_internal_signal = true;
       }
     }
-    // Add the oldest signal into the tracking for a wait
     if (!skip_internal_signal) {
-      external_signals_.push_back(signal_list_[current_id_]);
+      external_signals_.push_back(prev_signal);
     }
   }
 
@@ -583,10 +575,9 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
 
 // ================================================================================================
 void VirtualGPU::HwQueueTracker::ResetCurrentSignal() {
-  // Reset the signal and return
-  hsa_signal_silent_store_relaxed(signal_list_[current_id_]->signal_, 0);
-  // Fallback to the previous signal
-  current_id_ = (current_id_ == 0) ? (signal_list_.size() - 1) : (current_id_ - 1);
+  auto& chain = ActiveChain();
+  hsa_signal_silent_store_relaxed(chain.signals[chain.current_id]->signal_, 0);
+  chain.current_id = (chain.current_id == 0) ? (chain.signals.size() - 1) : (chain.current_id - 1);
 }
 
 // ================================================================================================

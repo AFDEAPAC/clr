@@ -42,6 +42,10 @@ enum HwQueueEngine : uint32_t {
   Unknown   = 3
 };
 
+inline bool IsSdmaEngine(HwQueueEngine engine) {
+  return engine == HwQueueEngine::SdmaRead || engine == HwQueueEngine::SdmaWrite;
+}
+
 } // namespace amd::roc
 
 #endif

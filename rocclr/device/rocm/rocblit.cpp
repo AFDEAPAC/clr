@@ -826,7 +826,7 @@ bool DmaBlitManager::hsaCopyStaged(const_address hostSrc, address hostDst, size_
         LogPrintfError("Hsa copy from host to device failed with code %d", status);
         return false;
       }
-      gpu().Barriers().WaitCurrent();
+      gpu().Barriers().WaitCurrent(gpu().Barriers().GetActiveEngine());
       totalSize -= size;
       offset += size;
       continue;
@@ -851,7 +851,7 @@ bool DmaBlitManager::hsaCopyStaged(const_address hostSrc, address hostDst, size_
             hsaBuffer, hostSrc + offset, size, active.handle);
 
     if (status == HSA_STATUS_SUCCESS) {
-      gpu().Barriers().WaitCurrent();
+      gpu().Barriers().WaitCurrent(gpu().Barriers().GetActiveEngine());
       memcpy(hostDst + offset, hsaBuffer, size);
     } else {
       gpu().Barriers().ResetCurrentSignal();
