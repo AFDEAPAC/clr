@@ -76,7 +76,7 @@ constexpr OpId OperationId(cl_command_type commandType) {
 bool IsEnabled(OpId operation_id);
 void ReportActivity(const amd::Command& command);
 
-
+void CommitRecord(OpId operation_id);
 
 const char* getOclCommandKindString(cl_command_type kind);
 }  // namespace amd::activity_prof
