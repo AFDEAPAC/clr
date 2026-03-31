@@ -562,11 +562,33 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
     signal->ts_ = nullptr;
   } else if (hsa_signal_load_relaxed(signal->signal_) > 0) {
     amd::ScopedLock lock(signal->LockSignalOps());
+    {
+      auto& chain = ChainForEngine(engine_);
+      hsa_queue_t* q = const_cast<VirtualGPU&>(gpu_).gpu_queue();
+      HIP_DLOG("[HIP-DEBUG] CpuWaitForSignal: signal=0x%lx, val=%ld, engine=%d, "
+               "vgpu_idx=%u, queue=%p, chain_cur=%zu/%zu, active_wait=%d, tid=%d\n",
+               signal->signal_.handle, (long)hsa_signal_load_relaxed(signal->signal_),
+               (int)engine_, gpu_.index(),
+               q ? q->base_address : nullptr,
+               chain.current_id, chain.signals.size(),
+               gpu_.ActiveWait() ? 1 : 0,
+               (int)syscall(SYS_gettid));
+    }
     ClPrint(amd::LOG_DEBUG, amd::LOG_COPY, "Host wait on completion_signal=0x%zx",
             signal->signal_.handle);
-    if (!WaitForSignal(signal->signal_, gpu_.ActiveWait())) {
+    uint32_t stall_iters = 0;
+    long stall_ms = 0;
+    if (!WaitForSignal(signal->signal_, gpu_.ActiveWait(), false, &stall_iters, &stall_ms)) {
       LogPrintfError("Failed signal [0x%lx] wait", signal->signal_);
       return false;
+    }
+    if (stall_iters > 0) {
+      if (auto* qi = const_cast<Device&>(gpu_.dev()).FindQueueInfo(
+              const_cast<VirtualGPU&>(gpu_).gpu_queue())) {
+        qi->stall_count.fetch_add(stall_iters, std::memory_order_relaxed);
+        qi->total_stall_ms.fetch_add(stall_ms, std::memory_order_relaxed);
+      }
+      const_cast<Device&>(gpu_.dev()).sdmaTracker().RecordFenceWait(stall_ms);
     }
     signal->flags_.done_ = true;
   }
@@ -1178,14 +1200,18 @@ void VirtualGPU::ResetQueueStates() {
 // ================================================================================================
 bool VirtualGPU::releaseGpuMemoryFence(bool skip_cpu_wait, bool force_barrier) {
   if (force_barrier || hasPendingDispatch_ || !Barriers().IsExternalSignalListEmpty()) {
-    // Dispatch barrier packet into the queue
     dispatchBarrierPacket(kBarrierPacketHeader);
     hasPendingDispatch_ = false;
     retainExternalSignals_ = false;
   }
 
-  // Check if runtime could skip CPU wait
   if (!skip_cpu_wait) {
+    HIP_DLOG("[HIP-DEBUG] releaseGpuMemoryFence: WAIT vgpu_idx=%u, "
+             "copy_cmd=%d, tid=%d\n",
+             index(), copy_command_type_, (int)syscall(SYS_gettid));
+    if (auto* qi = roc_device_.FindQueueInfo(gpu_queue_)) {
+      qi->fence_wait_count.fetch_add(1, std::memory_order_relaxed);
+    }
     Barriers().WaitCurrent();
 
     ResetQueueStates();
@@ -1318,6 +1344,8 @@ bool VirtualGPU::create() {
   uint32_t queue_size = ROC_AQL_QUEUE_SIZE;
   gpu_queue_ = roc_device_.acquireQueue(queue_size, cooperative_, cuMask_, priority_);
   if (!gpu_queue_) return false;
+  HIP_DLOG("[HIP-DEBUG] BIND vgpu_idx=%u -> queue=%p, tid=%d\n",
+           index(), gpu_queue_->base_address, (int)syscall(SYS_gettid));
 
   if (!initPool(dev().settings().kernargPoolSize_)) {
     LogError("Couldn't allocate arguments/signals for the queue");
@@ -1450,6 +1478,9 @@ address VirtualGPU::allocKernelArguments(size_t size, size_t alignment) {
 * and then calls start() to get the current host timestamp.
 */
 void VirtualGPU::profilingBegin(amd::Command& command, bool sdmaProfiling) {
+  if (auto* qi = roc_device_.FindQueueInfo(gpu_queue_)) {
+    qi->dispatch_count.fetch_add(1, std::memory_order_relaxed);
+  }
   if (command.profilingInfo().enabled_) {
     if (timestamp_ != nullptr) {
       LogWarning("Trying to create a second timestamp in VirtualGPU. \

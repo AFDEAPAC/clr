@@ -30,6 +30,9 @@
 #include "rocprintf.hpp"
 #include "hsa/hsa_ven_amd_aqlprofile.h"
 #include "rocsched.hpp"
+#include "rocdebuglog.hpp"
+#include <chrono>
+#include <sys/syscall.h>
 
 namespace amd::roc {
 class Device;
@@ -48,37 +51,94 @@ constexpr static uint64_t kUnlimitedWait = std::numeric_limits<uint64_t>::max();
 // then just wait instead of adding dependency wait signal.
 constexpr static uint64_t kForcedTimeout10us = 10;
 
-template <bool active_wait_timeout = false>
-inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool forced_wait = false) {
-  if (hsa_signal_load_relaxed(signal) > 0) {
-    uint64_t timeout = kTimeout100us;
-    if (active_wait) {
-      timeout = kUnlimitedWait;
+constexpr static uint64_t kTimeout4Secs = 4 * M;
+
+// Shared stall-loop with abort: waits in 4-sec chunks, logs stalls, aborts after max_wait_sec.
+// Returns true if signal completed, false if aborted due to timeout.
+inline bool WaitForSignalLoop(hsa_signal_t signal,
+                              std::chrono::steady_clock::time_point wait_start,
+                              hsa_wait_state_t wait_state, const char* mode_str,
+                              uint32_t* out_stall_iters, long* out_stall_ms) {
+  const long max_wait_ms = static_cast<long>(HIP_MAX_SIGNAL_WAIT) * 1000L;
+  uint32_t wait_iters = 0;
+
+  while (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
+                                   kTimeout4Secs, wait_state) != 0) {
+    wait_iters++;
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - wait_start).count();
+    HIP_DLOG("[HIP-DEBUG] WaitForSignal STALL(%s): signal=0x%lx, val=%ld, "
+             "elapsed=%ldms, iter=%u, tid=%d\n",
+             mode_str, signal.handle, (long)hsa_signal_load_relaxed(signal),
+             (long)elapsed, wait_iters, (int)syscall(SYS_gettid));
+
+    if (max_wait_ms > 0 && elapsed >= max_wait_ms) {
+      HIP_DLOG("[HIP-DEBUG] WaitForSignal ABORT: signal=0x%lx HUNG for %ldms "
+               "(limit=%lds), forcing signal completion. tid=%d\n",
+               signal.handle, (long)elapsed, (long)HIP_MAX_SIGNAL_WAIT,
+               (int)syscall(SYS_gettid));
+      LogPrintfError("[HIP-HANG] Signal 0x%lx hung for %ld ms, forcing abort",
+                     signal.handle, (long)elapsed);
+      hsa_signal_store_relaxed(signal, 0);
+      if (out_stall_iters) *out_stall_iters = wait_iters;
+      if (out_stall_ms) *out_stall_ms = elapsed;
+      return false;
     }
+  }
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - wait_start).count();
+  if (elapsed > 100 || wait_iters > 0) {
+    HIP_DLOG("[HIP-DEBUG] WaitForSignal DONE: signal=0x%lx, elapsed=%ldms, iters=%u, "
+             "mode=%s, tid=%d\n",
+             signal.handle, (long)elapsed, wait_iters, mode_str,
+             (int)syscall(SYS_gettid));
+  }
+  if (out_stall_iters) *out_stall_iters = wait_iters;
+  if (out_stall_ms) *out_stall_ms = elapsed;
+  return true;
+}
+
+template <bool active_wait_timeout = false>
+inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool forced_wait = false,
+                          uint32_t* out_stall_iters = nullptr, long* out_stall_ms = nullptr) {
+  if (hsa_signal_load_relaxed(signal) > 0) {
+    auto wait_start = std::chrono::steady_clock::now();
+    HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, val=%ld, active=%d, tid=%d\n",
+             signal.handle, (long)hsa_signal_load_relaxed(signal),
+             active_wait ? 1 : 0, (int)syscall(SYS_gettid));
+
     if (active_wait_timeout) {
-      // If forced wait is set, then wait for 10us, else dont wait. (ns * K = us)
-      timeout = (forced_wait ? kForcedTimeout10us : ROC_ACTIVE_WAIT_TIMEOUT) * K;
+      uint64_t timeout = (forced_wait ? kForcedTimeout10us : ROC_ACTIVE_WAIT_TIMEOUT) * K;
       if (timeout == 0) {
         return false;
       }
-    }
-
-    ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host active wait for Signal = (0x%lx) for %d ns",
-            signal.handle, timeout);
-
-    // Active wait with a timeout
-    if (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
-                                  timeout, HSA_WAIT_STATE_ACTIVE) != 0) {
-      if (active_wait_timeout) {
+      ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host active wait for Signal = (0x%lx) for %d ns",
+              signal.handle, timeout);
+      if (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
+                                    timeout, HSA_WAIT_STATE_ACTIVE) != 0) {
         return false;
       }
-      ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host blocked wait for Signal = (0x%lx)",
-              signal.handle);
+      if (out_stall_iters) *out_stall_iters = 0;
+      if (out_stall_ms) *out_stall_ms = 0;
+      return true;
+    }
 
-      // Wait until the completion with CPU suspend
+    if (active_wait) {
+      WaitForSignalLoop(signal, wait_start, HSA_WAIT_STATE_ACTIVE, "active",
+                        out_stall_iters, out_stall_ms);
+    } else {
+      ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host active wait for Signal = (0x%lx) for %d ns",
+              signal.handle, kTimeout100us);
       if (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
-                                    kUnlimitedWait, HSA_WAIT_STATE_BLOCKED) != 0) {
-        return false;
+                                    kTimeout100us, HSA_WAIT_STATE_ACTIVE) != 0) {
+        ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host blocked wait for Signal = (0x%lx)",
+                signal.handle);
+        WaitForSignalLoop(signal, wait_start, HSA_WAIT_STATE_BLOCKED, "blocked",
+                          out_stall_iters, out_stall_ms);
+      } else {
+        if (out_stall_iters) *out_stall_iters = 0;
+        if (out_stall_ms) *out_stall_ms = 0;
       }
     }
   }
