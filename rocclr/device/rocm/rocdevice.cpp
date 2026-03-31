@@ -37,6 +37,8 @@
 #include "device/rocm/rocblit.hpp"
 #include "device/rocm/rocvirtual.hpp"
 #include "device/rocm/rocprogram.hpp"
+#include "device/rocm/rocdebuglog.hpp"
+#include <sys/syscall.h>
 #include "device/rocm/rocmemory.hpp"
 #include "device/rocm/rocglinterop.hpp"
 #include "device/rocm/rocsignal.hpp"
@@ -3013,11 +3015,14 @@ static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
 
 // ================================================================================================
 hsa_queue_t* Device::getQueueFromPool(const uint qIndex) {
-  // Check if queue with refCount 0 is available to use
   if (queuePool_[qIndex].size() < GPU_MAX_HW_QUEUES) {
     for (auto it = queuePool_[qIndex].begin(); it != queuePool_[qIndex].end(); it++) {
       if (it->second.refCount == 0) {
         it->second.refCount++;
+        HIP_DLOG("[HIP-DEBUG] getQueueFromPool: REUSE idle queue=%p, refCount=%d, "
+                 "poolSize=%zu, maxHwQueues=%u, priority=%u\n",
+                 it->first->base_address, it->second.refCount,
+                 queuePool_[qIndex].size(), (uint)GPU_MAX_HW_QUEUES, qIndex);
         ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "Selected queue refCount: %p (%d)",
                 it->first->base_address, it->second.refCount);
         return it->first;
@@ -3030,6 +3035,10 @@ hsa_queue_t* Device::getQueueFromPool(const uint qIndex) {
           queuePool_[qIndex].begin(), queuePool_[qIndex].end(),
           [](PoolRef A, PoolRef B) { return A.second.refCount < B.second.refCount; });
       lowest->second.refCount++;
+      HIP_DLOG("[HIP-DEBUG] getQueueFromPool: SHARE queue=%p, refCount=%d, "
+               "poolSize=%zu/%u (AT MAX), priority=%u\n",
+               lowest->first->base_address, lowest->second.refCount,
+               queuePool_[qIndex].size(), (uint)GPU_MAX_HW_QUEUES, qIndex);
       ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "Selected queue refCount: %p (%d)",
               lowest->first->base_address, lowest->second.refCount);
       return lowest->first;
@@ -3198,7 +3207,8 @@ hsa_queue_t* Device::acquireQueue(uint32_t queue_size_hint, bool coop_queue,
     if (cuMask.size() != 0) {
       // add queues with custom CU mask into their special pool to keep track
       // of mapping of these queues to their associated queueInfo (i.e., hostcall buffers)
-      auto result = queueWithCUMaskPool_[qIndex].emplace(std::make_pair(queue, QueueInfo()));
+      auto result = queueWithCUMaskPool_[qIndex].emplace(std::piecewise_construct,
+          std::forward_as_tuple(queue), std::forward_as_tuple());
       assert(result.second && "QueueInfo already exists");
       auto& qInfo = result.first->second;
       qInfo.refCount = 1;
@@ -3212,10 +3222,15 @@ hsa_queue_t* Device::acquireQueue(uint32_t queue_size_hint, bool coop_queue,
     // per device.
     return queue;
   }
-  auto result = queuePool_[qIndex].emplace(std::make_pair(queue, QueueInfo()));
+  auto result = queuePool_[qIndex].emplace(std::piecewise_construct,
+      std::forward_as_tuple(queue), std::forward_as_tuple());
   assert(result.second && "QueueInfo already exists");
   auto &qInfo = result.first->second;
   qInfo.refCount = 1;
+  HIP_DLOG("[HIP-DEBUG] acquireQueue: NEW queue=%p, poolSize=%zu/%u, "
+           "priority=%u\n",
+           queue->base_address, queuePool_[qIndex].size(),
+           (uint)GPU_MAX_HW_QUEUES, qIndex);
   ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "acquireQueue refCount: %p (%d)",
           result.first->first->base_address, result.first->second.refCount);
   return queue;
@@ -3250,6 +3265,38 @@ void Device::releaseQueue(hsa_queue_t* queue, const std::vector<uint32_t>& cuMas
   }
 }
 
+// ================================================================================================
+Device::QueueInfo* Device::FindQueueInfo(hsa_queue_t* queue) {
+  if (!queue) return nullptr;
+  for (auto& pool : queuePool_) {
+    auto it = pool.find(queue);
+    if (it != pool.end()) return &it->second;
+  }
+  for (auto& pool : queueWithCUMaskPool_) {
+    auto it = pool.find(queue);
+    if (it != pool.end()) return &it->second;
+  }
+  return nullptr;
+}
+
+// ================================================================================================
+void Device::DumpQueueStats() {
+  HIP_DLOG("[HIP-DEBUG] === Queue Stats Dump ===\n");
+  int idx = 0;
+  for (auto& pool : queuePool_) {
+    for (auto& [q, info] : pool) {
+      HIP_DLOG("[HIP-DEBUG] Q[%d] addr=%p streams=%d dispatch=%lu d2h=%lu h2d=%lu "
+               "fence_wait=%lu stalls=%lu stall_ms=%lu\n",
+               idx, q->base_address, info.refCount,
+               info.dispatch_count.load(), info.d2h_count.load(), info.h2d_count.load(),
+               info.fence_wait_count.load(), info.stall_count.load(), info.total_stall_ms.load());
+      idx++;
+    }
+  }
+  HIP_DLOG("[HIP-DEBUG] === End Queue Stats ===\n");
+}
+
+// ================================================================================================
 void* Device::getOrCreateHostcallBuffer(hsa_queue_t* queue, bool coop_queue,
                                         const std::vector<uint32_t>& cuMask) {
   decltype(queuePool_)::value_type::iterator qIter;

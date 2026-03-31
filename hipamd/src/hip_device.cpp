@@ -20,6 +20,9 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_deprecated.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include "device/rocm/rocdebuglog.hpp"
 
 #include "hip_internal.hpp"
 #include "hip_mempool_impl.hpp"
@@ -159,19 +162,21 @@ void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stre
   amd::Command::EventWaitList eventWaitList(0);
   bool submitMarker = 0;
 
-  auto waitForStream = [&submitMarker,
-                         &eventWaitList](hip::Stream* stream) {
+  uint32_t total_streams_checked = 0;
+  uint32_t not_ready_count = 0;
+
+  auto waitForStream = [&submitMarker, &eventWaitList, &total_streams_checked,
+                         &not_ready_count](hip::Stream* stream) {
+    total_streams_checked++;
     if (amd::Command *command = stream->getLastQueuedCommand(true)) {
       amd::Event &event = command->event();
-      // Check HW status of the ROCcrl event.
-      // Note: not all ROCclr modes support HW status
       bool ready = stream->device().IsHwEventReady(event);
       if (!ready) {
         ready = (command->status() == CL_COMPLETE);
       }
       submitMarker |= stream->vdev()->isFenceDirty();
-      // Check the current active status
       if (!ready) {
+        not_ready_count++;
         command->notifyCmdQueue();
         eventWaitList.push_back(command);
       } else {
@@ -199,7 +204,35 @@ void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stre
     }
   }
 
-  // Check if we have to wait anything
+  {
+    thread_local uint64_t idle_call_count = 0;
+    if (not_ready_count > 0) {
+      idle_call_count = 0;
+      HIP_DLOG("[HIP-DEBUG] WaitActiveStreams: blocking_stream=%p, device=%d, "
+               "checked=%u, notReady=%u, waitNull=%d, tid=%d\n",
+               (void*)blocking_stream, blocking_stream->GetDevice()->deviceId(),
+               total_streams_checked, not_ready_count,
+               wait_null_stream ? 1 : 0, (int)syscall(SYS_gettid));
+    } else {
+      idle_call_count++;
+      if (idle_call_count <= 3 || (idle_call_count % 1000) == 0) {
+        HIP_DLOG("[HIP-DEBUG] WaitActiveStreams: blocking_stream=%p, device=%d, "
+                 "checked=%u, notReady=0, waitNull=%d, idle_calls=%lu, tid=%d\n",
+                 (void*)blocking_stream, blocking_stream->GetDevice()->deviceId(),
+                 total_streams_checked,
+                 wait_null_stream ? 1 : 0, idle_call_count, (int)syscall(SYS_gettid));
+      }
+      if (idle_call_count == 10000 || idle_call_count == 100000) {
+        HIP_DLOG("[HIP-DEBUG] WaitActiveStreams WARNING: possible cascade hang detected! "
+                 "idle_calls=%lu, blocking_stream=%p, tid=%d\n",
+                 idle_call_count, (void*)blocking_stream, (int)syscall(SYS_gettid));
+        LogPrintfError("[HIP-HANG] WaitActiveStreams spinning for %lu iterations "
+                       "-- possible cascade hang on stream %p",
+                       idle_call_count, (void*)blocking_stream);
+      }
+    }
+  }
+
   if (eventWaitList.size() > 0 || submitMarker) {
     amd::Command* command = new amd::Marker(*blocking_stream, kMarkerDisableFlush, eventWaitList);
     if (command != nullptr) {
@@ -208,7 +241,6 @@ void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stre
     }
   }
 
-  // Release all active commands. It's safe after the marker was enqueued
   for (const auto& it : eventWaitList) {
     it->release();
   }

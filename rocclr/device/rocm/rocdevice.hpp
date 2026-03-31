@@ -46,6 +46,7 @@
 #include "hsa/hsa_ven_amd_loader.h"
 
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <vector>
 #include <memory>
@@ -556,6 +557,26 @@ class Device : public NullDevice {
 
   hsa_amd_memory_pool_t SystemCoarseSegment() const { return system_coarse_segment_; }
 
+  struct QueueInfo {
+    int refCount;
+    void* hostcallBuffer_;
+    std::atomic<uint64_t> dispatch_count{0};
+    std::atomic<uint64_t> d2h_count{0};
+    std::atomic<uint64_t> h2d_count{0};
+    std::atomic<uint64_t> fence_wait_count{0};
+    std::atomic<uint64_t> stall_count{0};
+    std::atomic<uint64_t> total_stall_ms{0};
+    QueueInfo() : refCount(0), hostcallBuffer_(nullptr) {}
+    QueueInfo(QueueInfo&& o) noexcept
+        : refCount(o.refCount), hostcallBuffer_(o.hostcallBuffer_),
+          dispatch_count(o.dispatch_count.load()), d2h_count(o.d2h_count.load()),
+          h2d_count(o.h2d_count.load()), fence_wait_count(o.fence_wait_count.load()),
+          stall_count(o.stall_count.load()), total_stall_ms(o.total_stall_ms.load()) {}
+    QueueInfo& operator=(QueueInfo&&) = delete;
+    QueueInfo(const QueueInfo&) = delete;
+    QueueInfo& operator=(const QueueInfo&) = delete;
+  };
+
   //! Acquire HSA queue. This method can create a new HSA queue or
   //! share previously created
   hsa_queue_t* acquireQueue(uint32_t queue_size_hint, bool coop_queue = false,
@@ -564,6 +585,56 @@ class Device : public NullDevice {
 
   //! Release HSA queue
   void releaseQueue(hsa_queue_t*, const std::vector<uint32_t>& cuMask = {});
+
+  QueueInfo* FindQueueInfo(hsa_queue_t* queue);
+  void DumpQueueStats();
+
+  struct SdmaHealthTracker {
+    std::atomic<uint64_t> recent_stall_ms{0};
+    std::atomic<uint32_t> consecutive_stalls{0};
+    std::atomic<uint64_t> last_stall_time_ms{0};
+    std::atomic<bool> bypass_sdma{false};
+
+    static constexpr uint64_t kStallThresholdMs = 5000;
+    static constexpr uint32_t kStallCountToBypass = 2;
+    static constexpr uint64_t kBypassCooldownMs = 30000;
+
+    void RecordFenceWait(long elapsed_ms) {
+      if (elapsed_ms > static_cast<long>(kStallThresholdMs)) {
+        consecutive_stalls.fetch_add(1, std::memory_order_relaxed);
+        recent_stall_ms.store(elapsed_ms, std::memory_order_relaxed);
+        last_stall_time_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+        if (consecutive_stalls.load(std::memory_order_relaxed) >= kStallCountToBypass) {
+          bypass_sdma.store(true, std::memory_order_release);
+          HIP_DLOG("[HIP-DEBUG] SdmaHealthTracker: BYPASS SDMA activated "
+                   "(stalls=%u, last=%ldms)\n",
+                   consecutive_stalls.load(), elapsed_ms);
+        }
+      } else {
+        consecutive_stalls.store(0, std::memory_order_relaxed);
+      }
+    }
+
+    bool ShouldBypassSdma() {
+      if (!bypass_sdma.load(std::memory_order_acquire)) return false;
+      auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      auto last = last_stall_time_ms.load(std::memory_order_relaxed);
+      if (static_cast<uint64_t>(now_ms - last) > kBypassCooldownMs) {
+        bypass_sdma.store(false, std::memory_order_release);
+        consecutive_stalls.store(0, std::memory_order_relaxed);
+        HIP_DLOG("[HIP-DEBUG] SdmaHealthTracker: BYPASS SDMA cooldown expired, "
+                 "re-enabling SDMA\n");
+        return false;
+      }
+      return true;
+    }
+  };
+
+  SdmaHealthTracker& sdmaTracker() { return sdma_tracker_; }
 
   //! For the given HSA queue, return an existing hostcall buffer or create a
   //! new one. queuePool_ keeps a mapping from HSA queue to hostcall buffer.
@@ -653,10 +724,7 @@ class Device : public NullDevice {
   bool hsa_exclusive_gpu_access_;  //!< TRUE if current device was moved into exclusive GPU access mode
   static address mg_sync_;  //!< MGPU grid launch sync memory (SVM location)
 
-  struct QueueInfo {
-    int refCount;
-    void* hostcallBuffer_;
-  };
+  SdmaHealthTracker sdma_tracker_;
 
   //! a vector for keeping Pool of HSA queues with low, normal and high priorities for recycling
   std::vector<std::map<hsa_queue_t*, QueueInfo>> queuePool_;

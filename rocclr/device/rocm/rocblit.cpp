@@ -25,7 +25,10 @@
 #include "device/rocm/rockernel.hpp"
 #include "device/rocm/rocsched.hpp"
 #include "utils/debug.hpp"
+#include "rocdebuglog.hpp"
 #include <algorithm>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace amd::roc {
 DmaBlitManager::DmaBlitManager(VirtualGPU& gpu, Setup setup)
@@ -638,6 +641,11 @@ bool DmaBlitManager::copyImage(device::Memory& srcMemory, device::Memory& dstMem
 bool DmaBlitManager::hsaCopy(const Memory& srcMemory, const Memory& dstMemory,
                              const amd::Coord3D& srcOrigin, const amd::Coord3D& dstOrigin,
                              const amd::Coord3D& size, amd::CopyMetadata copyMetadata) const {
+  HIP_DLOG("[HIP-DEBUG] hsaCopy: size=%zu, srcDirect=%d, dstDirect=%d, "
+           "vgpu_idx=%u, tid=%d\n",
+           size[0], srcMemory.isHostMemDirectAccess() ? 1 : 0,
+           dstMemory.isHostMemDirectAccess() ? 1 : 0,
+           gpu().index(), (int)syscall(SYS_gettid));
   address src = reinterpret_cast<address>(srcMemory.getDeviceMemory());
   address dst = reinterpret_cast<address>(dstMemory.getDeviceMemory());
 
@@ -779,7 +787,20 @@ bool DmaBlitManager::hsaCopy(const Memory& srcMemory, const Memory& dstMemory,
 // ================================================================================================
 bool DmaBlitManager::hsaCopyStaged(const_address hostSrc, address hostDst, size_t size,
                                    address staging, bool hostToDev) const {
-  // Stall GPU, sicne CPU copy is possible
+  HIP_DLOG("[HIP-DEBUG] hsaCopyStaged: %s size=%zu, vgpu_idx=%u, tid=%d\n",
+           hostToDev ? "H2D" : "D2H", size,
+           gpu().index(), (int)syscall(SYS_gettid));
+  if (auto* qi = const_cast<Device&>(gpu().dev()).FindQueueInfo(gpu().gpu_queue())) {
+    if (hostToDev) qi->h2d_count.fetch_add(1, std::memory_order_relaxed);
+    else           qi->d2h_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  {
+    static std::atomic<uint64_t> copy_counter_{0};
+    auto c = copy_counter_.fetch_add(1, std::memory_order_relaxed);
+    if ((c & 0xFFF) == 0) {
+      const_cast<Device&>(gpu().dev()).DumpQueueStats();
+    }
+  }
   gpu().releaseGpuMemoryFence();
 
   // No allocation is necessary for Full Profile
@@ -1819,6 +1840,10 @@ bool KernelBlitManager::readBuffer(device::Memory& srcMemory, void* dstHost,
                                    bool entire, amd::CopyMetadata copyMetadata) const {
   amd::ScopedLock k(lockXferOps_);
   bool result = false;
+  HIP_DLOG("[HIP-DEBUG] KernelBlitManager::readBuffer(D2H): size=%zu, "
+           "directAccess=%d, vgpu_idx=%u, tid=%d\n",
+           size[0], srcMemory.isHostMemDirectAccess() ? 1 : 0,
+           gpu().index(), (int)syscall(SYS_gettid));
 
   if (dev().info().largeBar_ && size[0] <= DEBUG_CLR_MAX_D2H_CPU) {
     if ((srcMemory.owner()->getHostMem() == nullptr) &&
@@ -1941,6 +1966,10 @@ bool KernelBlitManager::writeBuffer(const void* srcHost, device::Memory& dstMemo
                                     bool entire, amd::CopyMetadata copyMetadata) const {
   amd::ScopedLock k(lockXferOps_);
   bool result = false;
+  HIP_DLOG("[HIP-DEBUG] KernelBlitManager::writeBuffer(H2D): size=%zu, "
+           "directAccess=%d, vgpu_idx=%u, tid=%d\n",
+           size[0], dstMemory.isHostMemDirectAccess() ? 1 : 0,
+           gpu().index(), (int)syscall(SYS_gettid));
   if (dev().info().largeBar_ && (size[0] <= DEBUG_CLR_MAX_H2D_CPU)) {
     if ((dstMemory.owner()->getHostMem() == nullptr) &&
         (dstMemory.owner()->getSvmPtr() != nullptr)) {
@@ -2274,6 +2303,13 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
   amd::ScopedLock k(lockXferOps_);
   bool result = false;
   bool p2p = false;
+  HIP_DLOG("[HIP-DEBUG] KernelBlitManager::copyBuffer: size=%zu, "
+           "srcDirect=%d, dstDirect=%d, crossDev=%d, vgpu_idx=%u, tid=%d\n",
+           sizeIn[0],
+           srcMemory.isHostMemDirectAccess() ? 1 : 0,
+           dstMemory.isHostMemDirectAccess() ? 1 : 0,
+           (&gpuMem(srcMemory).dev() != &gpuMem(dstMemory).dev()) ? 1 : 0,
+           gpu().index(), (int)syscall(SYS_gettid));
   uint32_t blit_wg_ = dev().settings().limit_blit_wg_;
 
   if (&gpuMem(srcMemory).dev() != &gpuMem(dstMemory).dev()) {
@@ -2335,13 +2371,20 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
       }
     }
 
+  bool sdmaBypass = const_cast<Device&>(dev()).sdmaTracker().ShouldBypassSdma() &&
+      (srcMemory.isHostMemDirectAccess() || dstMemory.isHostMemDirectAccess());
   bool useShaderCopyPath = setup_.disableHwlCopyBuffer_ ||
       (sizeIn[0] <= dev().settings().sdmaCopyThreshold_) ||
       (!(p2p || asan || ipcShared) &&
            (!srcMemory.isHostMemDirectAccess() && !dstMemory.isHostMemDirectAccess() &&
             !(copyMetadata.copyEnginePreference_ ==
               amd::CopyMetadata::CopyEnginePreference::SDMA)) ||
-       (copyMetadata.copyEnginePreference_ == amd::CopyMetadata::CopyEnginePreference::BLIT));
+       (copyMetadata.copyEnginePreference_ == amd::CopyMetadata::CopyEnginePreference::BLIT)) ||
+      sdmaBypass;
+
+  if (sdmaBypass && !useShaderCopyPath) {
+    useShaderCopyPath = true;
+  }
 
   if (!useShaderCopyPath) {
     if (amd::IS_HIP) {

@@ -24,6 +24,9 @@
 #include "thread/monitor.hpp"
 #include "hip_prof_api.h"
 #include <atomic>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include "device/rocm/rocdebuglog.hpp"
 
 namespace hip {
 
@@ -186,6 +189,11 @@ static hipError_t ihipStreamCreate(hipStream_t* stream,
   }
 
   *stream = reinterpret_cast<hipStream_t>(hStream);
+
+  HIP_DLOG("[HIP-DEBUG] ihipStreamCreate: stream=%p, vdev=%p, device=%d, "
+           "flags=0x%x, priority=%d, tid=%d\n",
+           (void*)*stream, (void*)hStream->vdev(), hip::getCurrentDevice()->deviceId(),
+           flags, (int)priority, (int)syscall(SYS_gettid));
 
   return hipSuccess;
 }
