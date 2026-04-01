@@ -39,8 +39,6 @@
 #include "device/rocm/rocprogram.hpp"
 #include "device/rocm/rocdebuglog.hpp"
 #include <sys/syscall.h>
-#include <sys/resource.h>
-#include <mutex>
 #include "device/rocm/rocmemory.hpp"
 #include "device/rocm/rocglinterop.hpp"
 #include "device/rocm/rocsignal.hpp"
@@ -652,16 +650,6 @@ void Device::tearDown() {
 
 // ================================================================================================
 bool Device::create() {
-  {
-    static std::once_flag core_disable_once;
-    std::call_once(core_disable_once, []() {
-      if (HIP_SKIP_ABORT_ON_GPU_ERROR) {
-        struct rlimit rl = {0, 0};
-        setrlimit(RLIMIT_CORE, &rl);
-      }
-    });
-  }
-
   char agent_name[64] = {0};
   if (HSA_STATUS_SUCCESS != hsa_agent_get_info(bkendDevice_, HSA_AGENT_INFO_NAME, agent_name)) {
     LogError("Unable to get HSA device name");
@@ -3000,31 +2988,9 @@ void Device::getHwEventTime(const amd::Event& event, uint64_t* start, uint64_t* 
 }
 
 // ================================================================================================
-static cl_int ConvertHSAErrorIntoCLError(hsa_status_t hsa_status) {
-  switch (hsa_status) {
-    case HSA_STATUS_ERROR_OUT_OF_RESOURCES:
-      return CL_INVALID_MEM_OBJECT;
-    case HSA_STATUS_ERROR_EXCEPTION:
-      return CL_INVALID_OPERATION;
-    default:
-      return CL_DEVICE_NOT_AVAILABLE;
-  }
-}
-
-static bool DumpCoreFile() {
-  struct rlimit rl;
-  return (getrlimit(RLIMIT_CORE, &rl) == 0 && rl.rlim_cur != 0);
-}
-
-static void DisableCoreIfRequested() {
-  if (HIP_SKIP_ABORT_ON_GPU_ERROR) {
-    struct rlimit rl = {0, 0};
-    setrlimit(RLIMIT_CORE, &rl);
-  }
-}
-
 static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
   if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
+    // Abort on device exceptions.
     const char* errorMsg = 0;
     hsa_status_string(status, &errorMsg);
     if (status == HSA_STATUS_ERROR_OUT_OF_RESOURCES) {
@@ -3036,22 +3002,14 @@ static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
         LogError("HSA_AMD_AGENT_INFO_MEMORY_AVAIL query failed.");
       }
       ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
-              "Callback: Queue %p error: %s Code: 0x%x Available Free mem: %zu MB",
+              "Callback: Queue %p Aborting with error : %s Code: 0x%x Available Free mem : %zu MB",
               queue->base_address, errorMsg, status, global_available_mem/Mi);
     } else {
       ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
-        "Callback: Queue %p error: %s code: 0x%x", queue->base_address,
+        "Callback: Queue %p aborting with error : %s code: 0x%x", queue->base_address,
         errorMsg, status);
     }
-    HIP_DLOG("[HIP-DEBUG] callbackQueue: queue=%p, status=0x%x (%s), "
-             "skip_abort=%u\n",
-             queue->base_address, status, errorMsg ? errorMsg : "?",
-             (uint)HIP_SKIP_ABORT_ON_GPU_ERROR);
-
-    if (DumpCoreFile() || !HIP_SKIP_ABORT_ON_GPU_ERROR) {
-      abort();
-    }
-    amd::Device::gpu_error_ = ConvertHSAErrorIntoCLError(status);
+    abort();
   }
 }
 

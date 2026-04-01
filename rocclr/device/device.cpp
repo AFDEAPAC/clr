@@ -298,7 +298,6 @@ const Isa* Isa::end() {
 
 std::vector<Device*>* Device::devices_ = nullptr;
 AppProfile Device::appProfile_;
-cl_int Device::gpu_error_ = CL_SUCCESS;
 
 Context* Device::glb_ctx_ = nullptr;
 Monitor Device::p2p_stage_ops_("P2P Staging Lock", true);
