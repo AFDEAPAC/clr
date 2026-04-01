@@ -77,8 +77,8 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
                "(limit=%lds), forcing signal completion. tid=%d\n",
                signal.handle, (long)elapsed, (long)HIP_MAX_SIGNAL_WAIT,
                (int)syscall(SYS_gettid));
-      LogPrintfError("[HIP-HANG] Signal 0x%lx hung for %ld ms, forcing abort",
-                     signal.handle, (long)elapsed);
+      LogPrintfWarning("[HIP-HANG] Signal 0x%lx hung for %ld ms, forcing recovery",
+                       signal.handle, (long)elapsed);
       hsa_signal_store_relaxed(signal, 0);
       if (out_stall_iters) *out_stall_iters = wait_iters;
       if (out_stall_ms) *out_stall_ms = elapsed;

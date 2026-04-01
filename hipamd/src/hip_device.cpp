@@ -226,9 +226,9 @@ void Device::WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stre
         HIP_DLOG("[HIP-DEBUG] WaitActiveStreams WARNING: possible cascade hang detected! "
                  "idle_calls=%lu, blocking_stream=%p, tid=%d\n",
                  idle_call_count, (void*)blocking_stream, (int)syscall(SYS_gettid));
-        LogPrintfError("[HIP-HANG] WaitActiveStreams spinning for %lu iterations "
-                       "-- possible cascade hang on stream %p",
-                       idle_call_count, (void*)blocking_stream);
+        LogPrintfWarning("[HIP-HANG] WaitActiveStreams spinning for %lu iterations "
+                         "-- possible cascade hang on stream %p",
+                         idle_call_count, (void*)blocking_stream);
       }
     }
   }
