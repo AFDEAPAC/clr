@@ -55,6 +55,8 @@ constexpr static uint64_t kTimeout4Secs = 4 * M;
 
 // Shared stall-loop with abort: waits in 4-sec chunks, logs stalls, aborts after max_wait_sec.
 // Returns true if signal completed, false if aborted due to timeout.
+// Uses hsa_signal_silent_store_relaxed for abort to bypass roctracer interception
+// and avoid ROCr signal validation abort when signal handle is in evicted state.
 inline bool WaitForSignalLoop(hsa_signal_t signal,
                               std::chrono::steady_clock::time_point wait_start,
                               hsa_wait_state_t wait_state, const char* mode_str,
@@ -67,19 +69,19 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
     wait_iters++;
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - wait_start).count();
-    HIP_DLOG("[HIP-DEBUG] WaitForSignal STALL(%s): signal=0x%lx, val=%ld, "
+    HIP_DLOG("[HIP-DEBUG] WaitForSignal STALL(%s): signal=0x%lx, "
              "elapsed=%ldms, iter=%u, tid=%d\n",
-             mode_str, signal.handle, (long)hsa_signal_load_relaxed(signal),
+             mode_str, signal.handle,
              (long)elapsed, wait_iters, (int)syscall(SYS_gettid));
 
     if (max_wait_ms > 0 && elapsed >= max_wait_ms) {
-      HIP_DLOG("[HIP-DEBUG] WaitForSignal ABORT: signal=0x%lx HUNG for %ldms "
+      HIP_DLOG("[HIP-DEBUG] WaitForSignal TIMEOUT: signal=0x%lx HUNG for %ldms "
                "(limit=%lds), forcing signal completion. tid=%d\n",
                signal.handle, (long)elapsed, (long)HIP_MAX_SIGNAL_WAIT,
                (int)syscall(SYS_gettid));
       LogPrintfWarning("[HIP-HANG] Signal 0x%lx hung for %ld ms, forcing recovery",
                        signal.handle, (long)elapsed);
-      hsa_signal_store_relaxed(signal, 0);
+      hsa_signal_silent_store_relaxed(signal, 0);
       if (out_stall_iters) *out_stall_iters = wait_iters;
       if (out_stall_ms) *out_stall_ms = elapsed;
       return false;
@@ -104,9 +106,8 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
                           uint32_t* out_stall_iters = nullptr, long* out_stall_ms = nullptr) {
   if (hsa_signal_load_relaxed(signal) > 0) {
     auto wait_start = std::chrono::steady_clock::now();
-    HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, val=%ld, active=%d, tid=%d\n",
-             signal.handle, (long)hsa_signal_load_relaxed(signal),
-             active_wait ? 1 : 0, (int)syscall(SYS_gettid));
+    HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, active=%d, tid=%d\n",
+             signal.handle, active_wait ? 1 : 0, (int)syscall(SYS_gettid));
 
     if (active_wait_timeout) {
       uint64_t timeout = (forced_wait ? kForcedTimeout10us : ROC_ACTIVE_WAIT_TIMEOUT) * K;

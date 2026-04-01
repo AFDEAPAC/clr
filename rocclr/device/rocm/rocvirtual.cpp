@@ -565,9 +565,9 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
     {
       auto& chain = ChainForEngine(engine_);
       hsa_queue_t* q = const_cast<VirtualGPU&>(gpu_).gpu_queue();
-      HIP_DLOG("[HIP-DEBUG] CpuWaitForSignal: signal=0x%lx, val=%ld, engine=%d, "
+      HIP_DLOG("[HIP-DEBUG] CpuWaitForSignal: signal=0x%lx, engine=%d, "
                "vgpu_idx=%u, queue=%p, chain_cur=%zu/%zu, active_wait=%d, tid=%d\n",
-               signal->signal_.handle, (long)hsa_signal_load_relaxed(signal->signal_),
+               signal->signal_.handle,
                (int)engine_, gpu_.index(),
                q ? q->base_address : nullptr,
                chain.current_id, chain.signals.size(),
