@@ -187,7 +187,9 @@ release(size_t, GPU_FORCE_BLIT_COPY_SIZE, 0,                                  \
 release(uint, ROC_ACTIVE_WAIT_TIMEOUT, 0,                                     \
         "Forces active wait of GPU interrup for the timeout(us)")             \
 release(uint, HIP_MAX_SIGNAL_WAIT, 60,                                        \
-        "Max seconds to wait for a GPU signal before abort (0=infinite)")             \
+        "Max seconds to wait for a GPU signal before abort (0=infinite)")     \
+release(uint, HIP_SKIP_ABORT_ON_GPU_ERROR, 1,                                 \
+        "Skip host abort on GPU queue errors (1=skip, 0=abort)")             \
 release(bool, ROC_ENABLE_LARGE_BAR, true,                                     \
         "Enable Large Bar if supported by the device")                        \
 release(bool, ROC_CPU_WAIT_FOR_SIGNAL, true,                                  \

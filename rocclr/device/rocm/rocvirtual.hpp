@@ -74,6 +74,17 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
              mode_str, signal.handle,
              (long)elapsed, wait_iters, (int)syscall(SYS_gettid));
 
+    if (HIP_SKIP_ABORT_ON_GPU_ERROR && amd::Device::IsGPUInError()) {
+      HIP_DLOG("[HIP-DEBUG] WaitForSignal GPU_ERROR: signal=0x%lx, "
+               "elapsed=%ldms, gpu_error=%d, tid=%d\n",
+               signal.handle, (long)elapsed, amd::Device::GetGPUError(),
+               (int)syscall(SYS_gettid));
+      hsa_signal_silent_store_relaxed(signal, 0);
+      if (out_stall_iters) *out_stall_iters = wait_iters;
+      if (out_stall_ms) *out_stall_ms = elapsed;
+      return false;
+    }
+
     if (max_wait_ms > 0 && elapsed >= max_wait_ms) {
       HIP_DLOG("[HIP-DEBUG] WaitForSignal TIMEOUT: signal=0x%lx HUNG for %ldms "
                "(limit=%lds), forcing signal completion. tid=%d\n",

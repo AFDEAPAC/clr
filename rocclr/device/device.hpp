@@ -2087,6 +2087,10 @@ class Device : public RuntimeObject {
 
   void SetActiveWait(bool state) { activeWait_ = state; }
 
+  static bool IsGPUInError() { return (gpu_error_ != CL_SUCCESS); }
+  static cl_int GetGPUError() { return gpu_error_; }
+  static cl_int gpu_error_;
+
   virtual amd::Memory* GetArenaMemObj(const void* ptr, size_t& offset, size_t size = 0) {
     return nullptr;
   }
