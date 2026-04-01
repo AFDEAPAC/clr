@@ -3047,7 +3047,7 @@ static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
     const char* errorMsg = 0;
     hsa_status_string(status, &errorMsg);
 
-    if (dev->IsInHangRecovery()) {
+    if (HIP_HANG_RECOVERY_ENABLE && dev->IsInHangRecovery()) {
       ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
               "[HIP-RECOVERY] Queue %p error suppressed (hang recovery active): %s code: 0x%x",
               queue->base_address, errorMsg, status);

@@ -62,7 +62,8 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
                               hsa_wait_state_t wait_state, const char* mode_str,
                               uint32_t* out_stall_iters, long* out_stall_ms,
                               bool* out_aborted = nullptr) {
-  const long max_wait_ms = static_cast<long>(HIP_MAX_SIGNAL_WAIT) * 1000L;
+  const long max_wait_ms = HIP_HANG_RECOVERY_ENABLE
+      ? static_cast<long>(HIP_MAX_SIGNAL_WAIT) * 1000L : 0;
   uint32_t wait_iters = 0;
   if (out_aborted) *out_aborted = false;
 
@@ -71,10 +72,13 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
     wait_iters++;
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - wait_start).count();
-    HIP_DLOG("[HIP-DEBUG] WaitForSignal STALL(%s): signal=0x%lx, "
-             "elapsed=%ldms, iter=%u, tid=%d\n",
-             mode_str, signal.handle,
-             (long)elapsed, wait_iters, (int)syscall(SYS_gettid));
+
+    if (HIP_HANG_RECOVERY_ENABLE) {
+      HIP_DLOG("[HIP-DEBUG] WaitForSignal STALL(%s): signal=0x%lx, "
+               "elapsed=%ldms, iter=%u, tid=%d\n",
+               mode_str, signal.handle,
+               (long)elapsed, wait_iters, (int)syscall(SYS_gettid));
+    }
 
     if (max_wait_ms > 0 && elapsed >= max_wait_ms) {
       HIP_DLOG("[HIP-DEBUG] WaitForSignal TIMEOUT: signal=0x%lx HUNG for %ldms "
@@ -112,8 +116,10 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
 
   if (hsa_signal_load_relaxed(signal) > 0) {
     auto wait_start = std::chrono::steady_clock::now();
-    HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, active=%d, tid=%d\n",
-             signal.handle, active_wait ? 1 : 0, (int)syscall(SYS_gettid));
+    if (HIP_HANG_RECOVERY_ENABLE) {
+      HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, active=%d, tid=%d\n",
+               signal.handle, active_wait ? 1 : 0, (int)syscall(SYS_gettid));
+    }
 
     if (active_wait_timeout) {
       uint64_t timeout = (forced_wait ? kForcedTimeout10us : ROC_ACTIVE_WAIT_TIMEOUT) * K;

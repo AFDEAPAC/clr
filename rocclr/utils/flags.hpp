@@ -186,8 +186,11 @@ release(size_t, GPU_FORCE_BLIT_COPY_SIZE, 0,                                  \
         "Use Blit until this size(in KB) for copies")                         \
 release(uint, ROC_ACTIVE_WAIT_TIMEOUT, 0,                                     \
         "Forces active wait of GPU interrup for the timeout(us)")             \
+release(uint, HIP_HANG_RECOVERY_ENABLE, 0,                                     \
+        "Enable hang recovery: signal timeout, SDMA bypass, SIGABRT handler" \
+        " (0=off default, 1=on)")                                            \
 release(uint, HIP_MAX_SIGNAL_WAIT, 60,                                        \
-        "Max seconds to wait for a GPU signal before abort (0=infinite)")             \
+        "Signal timeout seconds when hang recovery enabled (0=infinite)")    \
 release(bool, ROC_ENABLE_LARGE_BAR, true,                                     \
         "Enable Large Bar if supported by the device")                        \
 release(bool, ROC_CPU_WAIT_FOR_SIGNAL, true,                                  \

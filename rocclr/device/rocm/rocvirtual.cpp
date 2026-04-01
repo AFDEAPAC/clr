@@ -584,7 +584,7 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
       LogPrintfError("Failed signal [0x%lx] wait", signal->signal_);
       return false;
     }
-    if (aborted) {
+    if (HIP_HANG_RECOVERY_ENABLE && aborted) {
       auto& dev = const_cast<Device&>(gpu_.dev());
       dev.ActivateHangRecovery();
       dev.sdmaTracker().ForcePermanentBypass();
