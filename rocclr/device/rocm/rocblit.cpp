@@ -2371,8 +2371,10 @@ bool KernelBlitManager::copyBuffer(device::Memory& srcMemory, device::Memory& ds
       }
     }
 
-  bool sdmaBypass = const_cast<Device&>(dev()).sdmaTracker().ShouldBypassSdma() &&
-      (srcMemory.isHostMemDirectAccess() || dstMemory.isHostMemDirectAccess());
+  auto& tracker = const_cast<Device&>(dev()).sdmaTracker();
+  bool sdmaBypass = tracker.IsPermanentBypass() ||
+      (tracker.ShouldBypassSdma() &&
+       (srcMemory.isHostMemDirectAccess() || dstMemory.isHostMemDirectAccess()));
   bool useShaderCopyPath = setup_.disableHwlCopyBuffer_ ||
       (sizeIn[0] <= dev().settings().sdmaCopyThreshold_) ||
       (!(p2p || asan || ipcShared) &&

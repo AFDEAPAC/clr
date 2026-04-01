@@ -47,6 +47,8 @@ inline pthread_once_t& onceCtrl() {
   return o;
 }
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 inline void initLog() {
   const char* env = getenv("HIP_DEBUG_LOG");
   if (!env || env[0] == '\0' || (env[0] == '0' && env[1] == '\0')) {
@@ -54,14 +56,14 @@ inline void initLog() {
     return;
   }
 
-  char path[256];
+  char path[512];
   if (strcmp(env, "1") == 0) {
     snprintf(path, sizeof(path), "/tmp/hip_debug_%d.log", getpid());
   } else {
-    snprintf(path, sizeof(path), "%s", env);
+    snprintf(path, sizeof(path), "%.*s", (int)(sizeof(path) - 1), env);
     char* pct = strstr(path, "%d");
     if (pct) {
-      char tmp[256];
+      char tmp[512];
       *pct = '\0';
       snprintf(tmp, sizeof(tmp), "%s%d%s", path, getpid(), pct + 2);
       snprintf(path, sizeof(path), "%s", tmp);
@@ -81,6 +83,7 @@ inline void initLog() {
   }
 }
 
+#pragma GCC diagnostic pop
 inline void dlog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 inline void dlog(const char* fmt, ...) {
   pthread_once(&onceCtrl(), initLog);

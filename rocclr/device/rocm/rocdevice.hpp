@@ -594,6 +594,7 @@ class Device : public NullDevice {
     std::atomic<uint32_t> consecutive_stalls{0};
     std::atomic<uint64_t> last_stall_time_ms{0};
     std::atomic<bool> bypass_sdma{false};
+    std::atomic<bool> permanent_bypass_{false};
 
     static constexpr uint64_t kStallThresholdMs = 5000;
     static constexpr uint32_t kStallCountToBypass = 2;
@@ -618,7 +619,18 @@ class Device : public NullDevice {
       }
     }
 
+    void ForcePermanentBypass() {
+      permanent_bypass_.store(true, std::memory_order_release);
+      bypass_sdma.store(true, std::memory_order_release);
+      HIP_DLOG("[HIP-DEBUG] SdmaHealthTracker: PERMANENT SDMA bypass activated\n");
+    }
+
+    bool IsPermanentBypass() const {
+      return permanent_bypass_.load(std::memory_order_acquire);
+    }
+
     bool ShouldBypassSdma() {
+      if (permanent_bypass_.load(std::memory_order_acquire)) return true;
       if (!bypass_sdma.load(std::memory_order_acquire)) return false;
       auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -635,6 +647,22 @@ class Device : public NullDevice {
   };
 
   SdmaHealthTracker& sdmaTracker() { return sdma_tracker_; }
+
+  void ActivateHangRecovery() {
+    hang_recovery_mode_.store(true, std::memory_order_release);
+    total_signal_aborts_.fetch_add(1, std::memory_order_relaxed);
+    g_hang_recovery_active_.store(true, std::memory_order_release);
+    InstallAbortHandler();
+  }
+  bool IsInHangRecovery() const {
+    return hang_recovery_mode_.load(std::memory_order_acquire);
+  }
+  uint32_t TotalSignalAborts() const {
+    return total_signal_aborts_.load(std::memory_order_relaxed);
+  }
+
+  static std::atomic<bool> g_hang_recovery_active_;
+  static void InstallAbortHandler();
 
   //! For the given HSA queue, return an existing hostcall buffer or create a
   //! new one. queuePool_ keeps a mapping from HSA queue to hostcall buffer.
@@ -725,6 +753,8 @@ class Device : public NullDevice {
   static address mg_sync_;  //!< MGPU grid launch sync memory (SVM location)
 
   SdmaHealthTracker sdma_tracker_;
+  std::atomic<bool> hang_recovery_mode_{false};
+  std::atomic<uint32_t> total_signal_aborts_{0};
 
   //! a vector for keeping Pool of HSA queues with low, normal and high priorities for recycling
   std::vector<std::map<hsa_queue_t*, QueueInfo>> queuePool_;

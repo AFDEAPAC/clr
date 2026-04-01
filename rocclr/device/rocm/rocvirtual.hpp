@@ -60,9 +60,11 @@ constexpr static uint64_t kTimeout4Secs = 4 * M;
 inline bool WaitForSignalLoop(hsa_signal_t signal,
                               std::chrono::steady_clock::time_point wait_start,
                               hsa_wait_state_t wait_state, const char* mode_str,
-                              uint32_t* out_stall_iters, long* out_stall_ms) {
+                              uint32_t* out_stall_iters, long* out_stall_ms,
+                              bool* out_aborted = nullptr) {
   const long max_wait_ms = static_cast<long>(HIP_MAX_SIGNAL_WAIT) * 1000L;
   uint32_t wait_iters = 0;
+  if (out_aborted) *out_aborted = false;
 
   while (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
                                    kTimeout4Secs, wait_state) != 0) {
@@ -84,6 +86,7 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
       hsa_signal_silent_store_relaxed(signal, 0);
       if (out_stall_iters) *out_stall_iters = wait_iters;
       if (out_stall_ms) *out_stall_ms = elapsed;
+      if (out_aborted) *out_aborted = true;
       return false;
     }
   }
@@ -103,7 +106,10 @@ inline bool WaitForSignalLoop(hsa_signal_t signal,
 
 template <bool active_wait_timeout = false>
 inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool forced_wait = false,
-                          uint32_t* out_stall_iters = nullptr, long* out_stall_ms = nullptr) {
+                          uint32_t* out_stall_iters = nullptr, long* out_stall_ms = nullptr,
+                          bool* out_aborted = nullptr) {
+  if (out_aborted) *out_aborted = false;
+
   if (hsa_signal_load_relaxed(signal) > 0) {
     auto wait_start = std::chrono::steady_clock::now();
     HIP_DLOG("[HIP-DEBUG] WaitForSignal ENTER: signal=0x%lx, active=%d, tid=%d\n",
@@ -125,9 +131,10 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
       return true;
     }
 
+    bool aborted = false;
     if (active_wait) {
       WaitForSignalLoop(signal, wait_start, HSA_WAIT_STATE_ACTIVE, "active",
-                        out_stall_iters, out_stall_ms);
+                        out_stall_iters, out_stall_ms, &aborted);
     } else {
       ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host active wait for Signal = (0x%lx) for %d ns",
               signal.handle, kTimeout100us);
@@ -136,12 +143,13 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
         ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host blocked wait for Signal = (0x%lx)",
                 signal.handle);
         WaitForSignalLoop(signal, wait_start, HSA_WAIT_STATE_BLOCKED, "blocked",
-                          out_stall_iters, out_stall_ms);
+                          out_stall_iters, out_stall_ms, &aborted);
       } else {
         if (out_stall_iters) *out_stall_iters = 0;
         if (out_stall_ms) *out_stall_ms = 0;
       }
     }
+    if (out_aborted) *out_aborted = aborted;
   }
 
   return true;

@@ -578,9 +578,19 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
             signal->signal_.handle);
     uint32_t stall_iters = 0;
     long stall_ms = 0;
-    if (!WaitForSignal(signal->signal_, gpu_.ActiveWait(), false, &stall_iters, &stall_ms)) {
+    bool aborted = false;
+    if (!WaitForSignal(signal->signal_, gpu_.ActiveWait(), false,
+                       &stall_iters, &stall_ms, &aborted)) {
       LogPrintfError("Failed signal [0x%lx] wait", signal->signal_);
       return false;
+    }
+    if (aborted) {
+      auto& dev = const_cast<Device&>(gpu_.dev());
+      dev.ActivateHangRecovery();
+      dev.sdmaTracker().ForcePermanentBypass();
+      LogPrintfWarning("[HIP-RECOVERY] Signal 0x%lx aborted after %ld ms — "
+                       "hang recovery activated, SDMA permanently bypassed",
+                       signal->signal_.handle, stall_ms);
     }
     if (stall_iters > 0) {
       if (auto* qi = const_cast<Device&>(gpu_.dev()).FindQueueInfo(
@@ -2741,12 +2751,19 @@ void VirtualGPU::submitMigrateMemObjects(amd::MigrateMemObjectsCommand& vcmd) {
 // ================================================================================================
 static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
   if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
-    // Abort on device exceptions.
+    VirtualGPU* vgpu = reinterpret_cast<VirtualGPU*>(data);
     const char* errorMsg = 0;
     hsa_status_string(status, &errorMsg);
+
+    if (vgpu->dev().IsInHangRecovery()) {
+      ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
+              "[HIP-RECOVERY] Scheduler queue %p error suppressed (hang recovery active): "
+              "%s code: 0x%x", queue->base_address, errorMsg, status);
+      return;
+    }
+
     if (status == HSA_STATUS_ERROR_OUT_OF_RESOURCES) {
       size_t global_available_mem = 0;
-      VirtualGPU* vgpu = reinterpret_cast<VirtualGPU*>(data);
       if (HSA_STATUS_SUCCESS != hsa_agent_get_info(vgpu->gpu_device(),
                          static_cast<hsa_agent_info_t>(HSA_AMD_AGENT_INFO_MEMORY_AVAIL),
                          &global_available_mem)) {
