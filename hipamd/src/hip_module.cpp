@@ -426,10 +426,16 @@ hipError_t ihipModuleLaunchKernel(hipFunction_t f, uint32_t globalWorkSizeX,
   }
 
   if (command->status() == CL_INVALID_OPERATION) {
+    if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+      return hipErrorLaunchFailure;
+    }
     command->release();
     return hipErrorIllegalState;
   }
 
+  if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+    return hipErrorLaunchFailure;
+  }
   command->release();
 
   return hipSuccess;

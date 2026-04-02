@@ -663,6 +663,7 @@ class Device : public NullDevice {
 
   static std::atomic<bool> g_hang_recovery_active_;
   static void InstallAbortHandler();
+  static void RegisterGpuEventHandler();
 
   //! For the given HSA queue, return an existing hostcall buffer or create a
   //! new one. queuePool_ keeps a mapping from HSA queue to hostcall buffer.

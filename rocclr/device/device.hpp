@@ -52,6 +52,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <list>
 #include <set>
@@ -2086,6 +2087,9 @@ class Device : public RuntimeObject {
   bool ActiveWait() const { return activeWait_; }
 
   void SetActiveWait(bool state) { activeWait_ = state; }
+
+  static bool IsGPUInError() { return gpu_error_ != 0; }
+  static std::atomic<int> gpu_error_;
 
   virtual amd::Memory* GetArenaMemObj(const void* ptr, size_t& offset, size_t size = 0) {
     return nullptr;

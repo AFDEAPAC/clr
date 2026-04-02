@@ -182,6 +182,63 @@ void Device::InstallAbortHandler() {
   sigaction(SIGABRT, &sa, &g_old_sigabrt_action);
 }
 
+static std::atomic<bool> g_event_handler_installed{false};
+
+static hsa_status_t GpuSystemEventHandler(const hsa_amd_event_t* event, void* data) {
+  if (!HIP_HANG_RECOVERY_ENABLE) return HSA_STATUS_ERROR;
+
+  switch (event->event_type) {
+  case HSA_AMD_GPU_MEMORY_FAULT_EVENT: {
+    const auto& fault = event->memory_fault;
+    HIP_DLOG("[HIP-RECOVERY] GPU VM fault: agent=0x%lx, addr=%p, reason=0x%x\n",
+             fault.agent.handle, (void*)(uintptr_t)fault.virtual_address,
+             fault.fault_reason_mask);
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "[HIP-RECOVERY] GPU VM fault at %p suppressed — activating recovery\n",
+             (void*)(uintptr_t)fault.virtual_address);
+    write(STDERR_FILENO, msg, strlen(msg));
+    amd::Device::gpu_error_.store(1, std::memory_order_release);
+    Device::g_hang_recovery_active_.store(true, std::memory_order_release);
+    Device::InstallAbortHandler();
+    for (auto* dev : amd::Device::devices()) {
+      auto* rocDev = static_cast<Device*>(dev);
+      if (rocDev && !rocDev->isOnline()) continue;
+      rocDev->ActivateHangRecovery();
+      rocDev->sdmaTracker().ForcePermanentBypass();
+    }
+    return HSA_STATUS_SUCCESS;
+  }
+  case HSA_AMD_GPU_HW_EXCEPTION_EVENT: {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "[HIP-RECOVERY] GPU HW exception suppressed — activating recovery\n");
+    write(STDERR_FILENO, msg, strlen(msg));
+    amd::Device::gpu_error_.store(1, std::memory_order_release);
+    Device::g_hang_recovery_active_.store(true, std::memory_order_release);
+    Device::InstallAbortHandler();
+    return HSA_STATUS_SUCCESS;
+  }
+  case HSA_AMD_GPU_MEMORY_ERROR_EVENT: {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "[HIP-RECOVERY] GPU memory error suppressed — activating recovery\n");
+    write(STDERR_FILENO, msg, strlen(msg));
+    amd::Device::gpu_error_.store(1, std::memory_order_release);
+    Device::g_hang_recovery_active_.store(true, std::memory_order_release);
+    Device::InstallAbortHandler();
+    return HSA_STATUS_SUCCESS;
+  }
+  default:
+    return HSA_STATUS_ERROR;
+  }
+}
+
+void Device::RegisterGpuEventHandler() {
+  if (g_event_handler_installed.exchange(true, std::memory_order_acq_rel)) return;
+  hsa_amd_register_system_event_handler(GpuSystemEventHandler, nullptr);
+}
+
 bool NullDevice::create(const amd::Isa &isa) {
   if (!isa.runtimeRocSupported()) {
     LogPrintfError("Offline HSA device %s is not supported", isa.targetId());
@@ -546,6 +603,10 @@ bool Device::init() {
 
   hsa_system_get_major_extension_table(HSA_EXTENSION_AMD_LOADER, 1, sizeof(amd_loader_ext_table),
                                        &amd_loader_ext_table);
+
+  if (HIP_HANG_RECOVERY_ENABLE) {
+    Device::RegisterGpuEventHandler();
+  }
 
   status = hsa_iterate_agents(iterateAgentCallback, nullptr);
   if (status != HSA_STATUS_SUCCESS) {
