@@ -191,6 +191,9 @@ release(uint, HIP_HANG_RECOVERY_ENABLE, 0,                                     \
         " (0=off default, 1=on)")                                            \
 release(uint, HIP_MAX_SIGNAL_WAIT, 60,                                        \
         "Signal timeout seconds when hang recovery enabled (0=infinite)")    \
+release(uint, HIP_GPU_ERROR_EARLY_RETURN, 0,                                  \
+        "v7: Early-return all HIP APIs when GPU in error state."             \
+        " 0=off (v6 behavior), 1=on (v7 early-return guard)")               \
 release(bool, ROC_ENABLE_LARGE_BAR, true,                                     \
         "Enable Large Bar if supported by the device")                        \
 release(bool, ROC_CPU_WAIT_FOR_SIGNAL, true,                                  \

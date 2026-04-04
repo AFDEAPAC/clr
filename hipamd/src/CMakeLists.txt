@@ -204,22 +204,7 @@ if(__HIP_ENABLE_PCH)
   target_sources(amdhip64 PRIVATE ${CMAKE_BINARY_DIR}/hip_pch.o)
 endif()
 
-set(HIPRTC_OBJECTS)
-# Add hiprtc
-add_subdirectory(hiprtc)
-
-if(NOT WIN32)
-  target_compile_definitions(amdhip64 PRIVATE __HIP_ENABLE_RTC)
-  if(BUILD_SHARED_LIBS)
-    target_link_libraries(amdhip64 PRIVATE ${HIPRTC_OBJECTS})
-    add_dependencies(amdhip64 hiprtc-builtins)
-    INSTALL(TARGETS hiprtc-builtins
-      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-  endif()
-endif()
-
+# hiprtc disabled for this build
 #############################
 # Profiling API support
 #############################

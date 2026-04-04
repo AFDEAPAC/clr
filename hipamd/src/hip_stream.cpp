@@ -339,7 +339,7 @@ hipError_t hipStreamGetFlags_spt(hipStream_t stream, unsigned int* flags) {
 
 // ================================================================================================
 hipError_t hipStreamSynchronize_common(hipStream_t stream) {
-  if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+  if (HIP_GPU_ERROR_EARLY_RETURN && amd::Device::IsGPUInError()) {
     return hipSuccess;
   }
   if (!hip::isValid(stream)) {

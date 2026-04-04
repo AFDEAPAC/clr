@@ -362,7 +362,7 @@ hipError_t ihipModuleLaunchKernel(hipFunction_t f, uint32_t globalWorkSizeX,
                                   uint32_t flags = 0, uint32_t params = 0, uint32_t gridId = 0,
                                   uint32_t numGrids = 0, uint64_t prevGridSum = 0,
                                   uint64_t allGridSum = 0, uint32_t firstDevice = 0) {
-  if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+  if (HIP_GPU_ERROR_EARLY_RETURN && amd::Device::IsGPUInError()) {
     return hipErrorLaunchFailure;
   }
 
