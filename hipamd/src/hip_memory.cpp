@@ -701,6 +701,9 @@ hipError_t hipFree(void* ptr) {
 
 hipError_t hipMemcpy_common(void* dst, const void* src, size_t sizeBytes,
                             hipMemcpyKind kind, hipStream_t stream = nullptr) {
+  if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+    return hipErrorLaunchFailure;
+  }
   CHECK_STREAM_CAPTURING();
   hip::Stream* hip_stream = nullptr;
 
@@ -1521,6 +1524,9 @@ hipError_t hipMemcpyDtoD(hipDeviceptr_t dstDevice,
 
 hipError_t hipMemcpyAsync_common(void* dst, const void* src, size_t sizeBytes,
                           hipMemcpyKind kind, hipStream_t stream) {
+  if (HIP_HANG_RECOVERY_ENABLE && amd::Device::IsGPUInError()) {
+    return hipErrorLaunchFailure;
+  }
   STREAM_CAPTURE(hipMemcpyAsync, stream, dst, src, sizeBytes, kind);
 
   if (static_cast<uint32_t>(kind) > hipMemcpyDefault && kind != hipMemcpyDeviceToDeviceNoCU) {
