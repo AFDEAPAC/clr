@@ -28,6 +28,7 @@
 #include "platform/activity.hpp"
 #include "platform/kernel.hpp"
 #include "platform/context.hpp"
+#include <dlfcn.h>
 #include "platform/command.hpp"
 #include "platform/command_utils.hpp"
 #include "platform/memory.hpp"
@@ -587,10 +588,35 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
     if (HIP_HANG_RECOVERY_ENABLE && aborted) {
       auto& dev = const_cast<Device&>(gpu_.dev());
       dev.ActivateHangRecovery();
-      dev.sdmaTracker().ForcePermanentBypass();
-      LogPrintfWarning("[HIP-RECOVERY] Signal 0x%lx aborted after %ld ms — "
-                       "hang recovery activated, SDMA permanently bypassed",
-                       signal->signal_.handle, stall_ms);
+
+      using IsStuckFn = hsa_status_t(*)(hsa_agent_t, bool*);
+      using ResetFn = hsa_status_t(*)(hsa_agent_t);
+      static auto fn_stuck = (IsStuckFn)dlsym(RTLD_DEFAULT, "hsa_amd_sdma_engine_is_stuck");
+      static auto fn_reset = (ResetFn)dlsym(RTLD_DEFAULT, "hsa_amd_sdma_queue_reset");
+
+      bool is_stuck = false;
+      if (fn_stuck) {
+        fn_stuck(dev.getBackendDevice(), &is_stuck);
+      }
+
+      if (is_stuck && fn_reset) {
+        auto rst = fn_reset(dev.getBackendDevice());
+        if (rst == HSA_STATUS_SUCCESS) {
+          fprintf(stderr, "[HIP-RECOVERY] SDMA queue reset OK — clearing bypass, resuming SDMA\n");
+          dev.DeactivateHangRecovery();
+          amd::Device::ClearGPUError();
+          dev.sdmaTracker().ClearBypass();
+        } else {
+          dev.sdmaTracker().ForcePermanentBypass();
+          fprintf(stderr, "[HIP-RECOVERY] SDMA reset failed (0x%x) — shader bypass\n", rst);
+        }
+      } else if (!is_stuck) {
+        dev.sdmaTracker().ForcePermanentBypass();
+        fprintf(stderr, "[HIP-RECOVERY] Signal timeout — shader bypass until SDMA recovers\n");
+      } else {
+        dev.sdmaTracker().ForcePermanentBypass();
+        fprintf(stderr, "[HIP-RECOVERY] SDMA stuck, no reset API — shader bypass\n");
+      }
     }
     if (stall_iters > 0) {
       if (auto* qi = const_cast<Device&>(gpu_.dev()).FindQueueInfo(

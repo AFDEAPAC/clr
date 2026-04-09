@@ -190,31 +190,20 @@ static hsa_status_t GpuSystemEventHandler(const hsa_amd_event_t* event, void* da
   switch (event->event_type) {
   case HSA_AMD_GPU_MEMORY_FAULT_EVENT: {
     const auto& fault = event->memory_fault;
-    HIP_DLOG("[HIP-RECOVERY] GPU VM fault: agent=0x%lx, addr=%p, reason=0x%x\n",
-             fault.agent.handle, (void*)(uintptr_t)fault.virtual_address,
-             fault.fault_reason_mask);
     char msg[256];
     snprintf(msg, sizeof(msg),
-             "[HIP-RECOVERY] GPU VM fault at %p suppressed — activating recovery\n",
-             (void*)(uintptr_t)fault.virtual_address);
+             "[HIP-RECOVERY] GPU VM fault at %p (reason=0x%x) — suppressed, recovery active\n",
+             (void*)(uintptr_t)fault.virtual_address, fault.fault_reason_mask);
     write(STDERR_FILENO, msg, strlen(msg));
-    amd::Device::gpu_error_.store(1, std::memory_order_release);
     Device::g_hang_recovery_active_.store(true, std::memory_order_release);
     Device::InstallAbortHandler();
-    for (auto* dev : amd::Device::devices()) {
-      auto* rocDev = static_cast<Device*>(dev);
-      if (rocDev && !rocDev->isOnline()) continue;
-      rocDev->ActivateHangRecovery();
-      rocDev->sdmaTracker().ForcePermanentBypass();
-    }
     return HSA_STATUS_SUCCESS;
   }
   case HSA_AMD_GPU_HW_EXCEPTION_EVENT: {
     char msg[128];
     snprintf(msg, sizeof(msg),
-             "[HIP-RECOVERY] GPU HW exception suppressed — activating recovery\n");
+             "[HIP-RECOVERY] GPU HW exception — suppressed, recovery active\n");
     write(STDERR_FILENO, msg, strlen(msg));
-    amd::Device::gpu_error_.store(1, std::memory_order_release);
     Device::g_hang_recovery_active_.store(true, std::memory_order_release);
     Device::InstallAbortHandler();
     return HSA_STATUS_SUCCESS;
@@ -222,9 +211,8 @@ static hsa_status_t GpuSystemEventHandler(const hsa_amd_event_t* event, void* da
   case HSA_AMD_GPU_MEMORY_ERROR_EVENT: {
     char msg[128];
     snprintf(msg, sizeof(msg),
-             "[HIP-RECOVERY] GPU memory error suppressed — activating recovery\n");
+             "[HIP-RECOVERY] GPU memory error — suppressed, recovery active\n");
     write(STDERR_FILENO, msg, strlen(msg));
-    amd::Device::gpu_error_.store(1, std::memory_order_release);
     Device::g_hang_recovery_active_.store(true, std::memory_order_release);
     Device::InstallAbortHandler();
     return HSA_STATUS_SUCCESS;

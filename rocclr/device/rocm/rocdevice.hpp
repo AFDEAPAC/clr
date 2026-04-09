@@ -629,6 +629,11 @@ class Device : public NullDevice {
       return permanent_bypass_.load(std::memory_order_acquire);
     }
 
+    void ClearBypass() {
+      permanent_bypass_.store(false, std::memory_order_release);
+      bypass_sdma.store(false, std::memory_order_release);
+    }
+
     bool ShouldBypassSdma() {
       if (permanent_bypass_.load(std::memory_order_acquire)) return true;
       if (!bypass_sdma.load(std::memory_order_acquire)) return false;
@@ -653,6 +658,10 @@ class Device : public NullDevice {
     total_signal_aborts_.fetch_add(1, std::memory_order_relaxed);
     g_hang_recovery_active_.store(true, std::memory_order_release);
     InstallAbortHandler();
+  }
+  void DeactivateHangRecovery() {
+    hang_recovery_mode_.store(false, std::memory_order_release);
+    g_hang_recovery_active_.store(false, std::memory_order_release);
   }
   bool IsInHangRecovery() const {
     return hang_recovery_mode_.load(std::memory_order_acquire);

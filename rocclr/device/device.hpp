@@ -2089,6 +2089,8 @@ class Device : public RuntimeObject {
   void SetActiveWait(bool state) { activeWait_ = state; }
 
   static bool IsGPUInError() { return gpu_error_ != 0; }
+  static void SetGPUError(int v) { gpu_error_.store(v, std::memory_order_release); }
+  static void ClearGPUError() { gpu_error_.store(0, std::memory_order_release); }
   static std::atomic<int> gpu_error_;
 
   virtual amd::Memory* GetArenaMemObj(const void* ptr, size_t& offset, size_t size = 0) {
