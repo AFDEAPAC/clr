@@ -1061,7 +1061,12 @@ hipError_t ihipArrayDestroy(hipArray_t array) {
 
   auto image = as_amd(memObj);
   // Wait on the device, associated with the current memory object during allocation
-  g_devices[image->getUserData().deviceId]->SyncAllStreams();
+  const uint64_t sync_ns = FreeSyncFailNs();
+  if (sync_ns != 0) {
+    g_devices[image->getUserData().deviceId]->SyncAllStreamsBounded(true, sync_ns);
+  } else {
+    g_devices[image->getUserData().deviceId]->SyncAllStreams();
+  }
   image->release();
 
   delete array;
@@ -1585,7 +1590,12 @@ hipError_t ihipHostUnregister(void* hostPtr) {
   if (mem != nullptr) {
     const uint64_t registered_size = mem->getSize();
     // Wait on the device, associated with the current memory object during allocation
-    g_devices[mem->getUserData().deviceId]->SyncAllStreams();
+    const uint64_t sync_ns = FreeSyncFailNs();
+    if (sync_ns != 0) {
+      g_devices[mem->getUserData().deviceId]->SyncAllStreamsBounded(true, sync_ns);
+    } else {
+      g_devices[mem->getUserData().deviceId]->SyncAllStreams();
+    }
 
     amd::MemObjMap::RemoveMemObj(hostPtr);
     for (const auto& device: g_devices) {
@@ -3886,7 +3896,12 @@ hipError_t hipIpcCloseMemHandle(void* dev_ptr) {
   amd_mem_obj = amd::MemObjMap::FindMemObj(dev_ptr);
   if (amd_mem_obj != nullptr) {
     auto device_id = amd_mem_obj->getUserData().deviceId;
-    g_devices[device_id]->SyncAllStreams();
+    const uint64_t sync_ns = FreeSyncFailNs();
+    if (sync_ns != 0) {
+      g_devices[device_id]->SyncAllStreamsBounded(true, sync_ns);
+    } else {
+      g_devices[device_id]->SyncAllStreams();
+    }
   }
 
   /* Call IPC Detach from Device class */
@@ -4612,7 +4627,12 @@ hipError_t ihipMipmappedArrayDestroy(hipMipmappedArray_t mipmapped_array_ptr) {
 
   auto image = as_amd(mem_obj);
   // Wait on the device, associated with the current memory object during allocation
-  g_devices[image->getUserData().deviceId]->SyncAllStreams();
+  const uint64_t sync_ns = FreeSyncFailNs();
+  if (sync_ns != 0) {
+    g_devices[image->getUserData().deviceId]->SyncAllStreamsBounded(true, sync_ns);
+  } else {
+    g_devices[image->getUserData().deviceId]->SyncAllStreams();
+  }
   image->release();
 
   delete mipmapped_array_ptr;
