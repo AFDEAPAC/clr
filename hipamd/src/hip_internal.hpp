@@ -590,6 +590,11 @@ public:
     void destroyAllStreams();
 
     void SyncAllStreams( bool cpu_wait = true);
+    // K-6 V17.5: bounded SyncAllStreams. wall_deadline_ns == 0 means
+    // "no deadline" (identical to SyncAllStreams). Used by hipFree when
+    // HIP_FREE_SYNC_FAIL_MS / HIP_SERVICE_SURVIVAL is set so a single
+    // hipFree call cannot stall behind a long backlog of poisoned streams.
+    void SyncAllStreamsBounded( bool cpu_wait, uint64_t wall_deadline_ns);
 
     bool StreamCaptureBlocking();
 

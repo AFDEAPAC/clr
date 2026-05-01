@@ -18,6 +18,7 @@
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  THE SOFTWARE. */
 
+#include <chrono>
 #include <hip/hip_runtime.h>
 #include <hip/hip_deprecated.h>
 
@@ -253,7 +254,21 @@ void Device::destroyAllStreams() {
 
 // ================================================================================================
 void Device::SyncAllStreams( bool cpu_wait) {
-  // Make a local copy to avoid stalls for GPU finish with multiple threads
+  // K-6 V17.5: forward to the bounded variant with no deadline. Existing
+  // call sites (other than hipFree) keep their pre-V17.5 behaviour.
+  SyncAllStreamsBounded(cpu_wait, 0);
+}
+
+// K-6 V17.5: bounded version. wall_deadline_ns == 0 means no deadline.
+// Otherwise: total wall-clock time spent in this call is capped at
+// (NowNs() at entry + wall_deadline_ns). Once the deadline is exceeded,
+// any remaining streams are NOT waited on -- their retain() reference is
+// still released so we do not leak. The caller (hipFree) is expected to
+// check elapsed time after the call and return hipErrorNotReady to its
+// own caller, so the customer service loop sees a fast failure instead
+// of a multi-minute stall.
+void Device::SyncAllStreamsBounded( bool cpu_wait, uint64_t wall_deadline_ns) {
+  // Make a local copy to avoid stalls for GPU finish with multiple threads.
   std::vector<hip::Stream*> streams;
   streams.reserve(streamSet.size());
   {
@@ -263,10 +278,34 @@ void Device::SyncAllStreams( bool cpu_wait) {
       it->retain();
     }
   }
+
+  // Compute absolute deadline (monotonic clock ns).
+  uint64_t deadline_abs_ns = 0;
+  if (wall_deadline_ns != 0) {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    uint64_t now_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    deadline_abs_ns = now_ns + wall_deadline_ns;
+  }
+
+  bool deadline_hit = false;
   for (auto it : streams) {
-    it->finish(cpu_wait);
+    if (!deadline_hit && deadline_abs_ns != 0) {
+      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      uint64_t now_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+      if (now_ns >= deadline_abs_ns) {
+        deadline_hit = true;
+      }
+    }
+    if (!deadline_hit) {
+      it->finish(cpu_wait);
+    }
+    // Always release retain() so we never leak the stream ref, even if we
+    // skipped the finish() above due to deadline.
     it->release();
   }
+
   // Release freed memory for all memory pools on the device
   ReleaseFreedMemory();
   // Release all graph exec objects destroyed by user.

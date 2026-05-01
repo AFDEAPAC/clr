@@ -286,9 +286,17 @@ hipError_t ihipFree(void *ptr) {
     if (FreeRejectOnActive() && g_devices[device_id]->existsActiveStreamForDevice()) {
       return hipErrorNotReady;
     }
+    // K-6 V17.5: bound SyncAllStreams wall-clock to HIP_FREE_SYNC_FAIL_MS so
+    // hipFree cannot stall for N x ROCR_SIGNAL_WAIT_MAX_MS when there are
+    // many poisoned streams. If sync_fail_ns is 0 we fall through to the
+    // unbounded version exactly like the pre-K6 build.
     const uint64_t sync_start_ns = NowNs();
-    g_devices[device_id]->SyncAllStreams();
     const uint64_t sync_fail_ns = FreeSyncFailNs();
+    if (sync_fail_ns != 0) {
+      g_devices[device_id]->SyncAllStreamsBounded(true, sync_fail_ns);
+    } else {
+      g_devices[device_id]->SyncAllStreams();
+    }
     if (sync_fail_ns != 0 && NowNs() - sync_start_ns > sync_fail_ns) {
       return hipErrorNotReady;
     }
