@@ -20,6 +20,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
+#include <cstdlib>
+
 #include "hip_internal.hpp"
 
 #undef hipChooseDevice
@@ -614,11 +617,34 @@ hipError_t hipDeviceSetSharedMemConfig(hipSharedMemConfig config) {
   HIP_RETURN(hipSuccess);
 }
 
+namespace {
+// K-6.2 V17.5: opt-in bound for hipDeviceSynchronize. Reads the same
+// HIP_FREE_SYNC_FAIL_MS env that K-6 / K-6.1 read in hip_memory.cpp.
+// Self-contained to avoid cross-TU coupling. ms == 0 keeps pre-V17.5 behaviour.
+static uint64_t HipDevSyncFailNs() {
+  const char* v = std::getenv("HIP_FREE_SYNC_FAIL_MS");
+  if (v == nullptr || *v == '\0') return 0;
+  char* end = nullptr;
+  unsigned long long ms = std::strtoull(v, &end, 10);
+  if (end == v) return 0;
+  return ms == 0 ? 0 : (uint64_t)ms * 1000000ULL;
+}
+}  // anonymous namespace
+
 hipError_t hipDeviceSynchronize() {
   HIP_INIT_API(hipDeviceSynchronize);
   CHECK_SUPPORTED_DURING_CAPTURE();
   constexpr bool kDoWaitForCpu = false;
-  hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+  // K-6.2 V17.5: bound the SyncAllStreams loop with the same HIP_FREE_SYNC_FAIL_MS
+  // as K-6 (hipFree) and K-6.1 (hipHostUnregister/hipFreeArray/...). No early-return
+  // on timeout to preserve hipSuccess contract -- caller must rely on subsequent
+  // op return codes if it cares about completeness.
+  const uint64_t sync_ns = HipDevSyncFailNs();
+  if (sync_ns != 0) {
+    hip::getCurrentDevice()->SyncAllStreamsBounded(kDoWaitForCpu, sync_ns);
+  } else {
+    hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+  }
   HIP_RETURN(hipSuccess);
 }
 
