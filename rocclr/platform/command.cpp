@@ -234,9 +234,28 @@ void Event::processCallbacks(int32_t status) const {
 }
 
 static constexpr bool kCpuWait = true;
+
+// K-7.3: process-global degraded flag. Once any awaitCompletion times out,
+// all subsequent calls return immediately (fail-fast). Prevents N×timeout
+// compounding when GPU is permanently hung.
+static std::atomic<bool> g_await_degraded{false};
+
 // ================================================================================================
 bool Event::awaitCompletion() {
   if (status() > CL_COMPLETE) {
+    // K-7.3: fail-fast if GPU already known to be degraded.
+    static uint64_t await_timeout_ms = []() -> uint64_t {
+      const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+      if (!surv || surv[0] != '1') return 0;
+      const char* ms_str = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
+      uint64_t ms = ms_str ? std::strtoull(ms_str, nullptr, 10) : 10000;
+      return ms ? ms : 10000;
+    }();
+
+    if (await_timeout_ms && g_await_degraded.load(std::memory_order_relaxed)) {
+      return false;
+    }
+
     // Notifies the current command queue about waiting
     if (!notifyCmdQueue(kCpuWait)) {
       return false;
@@ -246,47 +265,23 @@ bool Event::awaitCompletion() {
       this, status());
     auto* queue = command().queue();
     if ((queue != nullptr) && queue->vdev()->ActiveWait()) {
-      // K-7.2: add wall-clock timeout to ActiveWait yield loop.
-      // Without this, if GPU never completes (SDMA saturated, queue wedged),
-      // the thread spins forever in sched_yield(). Use ROCR_SIGNAL_WAIT_MAX_MS
-      // as the cap (same value the signal wait path uses).
-      static uint64_t await_timeout_ms = []() -> uint64_t {
-        const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
-        if (!surv || surv[0] != '1') return 0;  // no timeout if survival off
-        const char* ms_str = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
-        uint64_t ms = ms_str ? std::strtoull(ms_str, nullptr, 10) : 10000;
-        return ms ? ms : 10000;
-      }();
-
       auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::milliseconds(await_timeout_ms ? await_timeout_ms : UINT64_MAX/2);
       while (status() > CL_COMPLETE) {
         if (await_timeout_ms &&
             std::chrono::steady_clock::now() > deadline) {
-          ClPrint(LOG_ERROR, LOG_WAIT,
-            "Event %p awaitCompletion: ActiveWait timeout after %llu ms (survival mode)",
-            this, (unsigned long long)await_timeout_ms);
-          break;  // bail out — GPU didn't complete in time
+          g_await_degraded.store(true, std::memory_order_relaxed);
+          break;
         }
         amd::Os::yield();
       }
     } else {
-      // K-7.2: In survival mode, use polling instead of blocking wait.
-      // Monitor::wait() has no timeout and can block forever if GPU never
-      // signals completion. Instead poll status with short sleeps.
-      static uint64_t await_timeout_ms_cv = []() -> uint64_t {
-        const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
-        if (!surv || surv[0] != '1') return 0;
-        const char* ms_str = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
-        uint64_t ms = ms_str ? std::strtoull(ms_str, nullptr, 10) : 10000;
-        return ms ? ms : 10000;
-      }();
-
-      if (await_timeout_ms_cv) {
+      if (await_timeout_ms) {
         auto deadline_cv = std::chrono::steady_clock::now()
-                         + std::chrono::milliseconds(await_timeout_ms_cv);
+                         + std::chrono::milliseconds(await_timeout_ms);
         while (status() > CL_COMPLETE) {
           if (std::chrono::steady_clock::now() > deadline_cv) {
+            g_await_degraded.store(true, std::memory_order_relaxed);
             break;
           }
           amd::Os::yield();
