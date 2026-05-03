@@ -235,15 +235,14 @@ void Event::processCallbacks(int32_t status) const {
 
 static constexpr bool kCpuWait = true;
 
-// K-7.3: process-global degraded flag. Once any awaitCompletion times out,
-// all subsequent calls return immediately (fail-fast). Prevents N×timeout
-// compounding when GPU is permanently hung.
-static std::atomic<bool> g_await_degraded{false};
-
 // ================================================================================================
 bool Event::awaitCompletion() {
   if (status() > CL_COMPLETE) {
-    // K-7.3: fail-fast if GPU already known to be degraded.
+    // K-7.3 / K-7.4: fail-fast if this Event's device is already known to
+    // be degraded (an earlier awaitCompletion on the same device timed out).
+    // K-7.4 V17.5: the degraded flag is per-device, NOT process-global, so
+    // a transient hang on one GPU does not fail-fast healthy events on
+    // other GPUs in the same process.
     static uint64_t await_timeout_ms = []() -> uint64_t {
       const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
       if (!surv || surv[0] != '1') return 0;
@@ -252,7 +251,10 @@ bool Event::awaitCompletion() {
       return ms ? ms : 10000;
     }();
 
-    if (await_timeout_ms && g_await_degraded.load(std::memory_order_relaxed)) {
+    auto* queue = command().queue();
+
+    if (await_timeout_ms && queue != nullptr &&
+        queue->device().AwaitDegraded()) {
       return false;
     }
 
@@ -263,14 +265,13 @@ bool Event::awaitCompletion() {
 
     ClPrint(LOG_DEBUG, LOG_WAIT, "Waiting for event %p to complete, current status %d",
       this, status());
-    auto* queue = command().queue();
     if ((queue != nullptr) && queue->vdev()->ActiveWait()) {
       auto deadline = std::chrono::steady_clock::now()
                     + std::chrono::milliseconds(await_timeout_ms ? await_timeout_ms : UINT64_MAX/2);
       while (status() > CL_COMPLETE) {
         if (await_timeout_ms &&
             std::chrono::steady_clock::now() > deadline) {
-          g_await_degraded.store(true, std::memory_order_relaxed);
+          queue->device().SetAwaitDegraded();
           break;
         }
         amd::Os::yield();
@@ -281,7 +282,9 @@ bool Event::awaitCompletion() {
                          + std::chrono::milliseconds(await_timeout_ms);
         while (status() > CL_COMPLETE) {
           if (std::chrono::steady_clock::now() > deadline_cv) {
-            g_await_degraded.store(true, std::memory_order_relaxed);
+            if (queue != nullptr) {
+              queue->device().SetAwaitDegraded();
+            }
             break;
           }
           amd::Os::yield();

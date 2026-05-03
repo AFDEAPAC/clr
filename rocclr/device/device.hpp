@@ -45,6 +45,7 @@
 #endif
 #endif
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -2087,6 +2088,24 @@ class Device : public RuntimeObject {
 
   void SetActiveWait(bool state) { activeWait_ = state; }
 
+  // K-7.4 V17.5: per-device awaitCompletion-degraded flag.
+  // Replaces the K-7.3 process-global g_await_degraded so a transient hang
+  // on one GPU does not fail-fast Event::awaitCompletion on every other
+  // healthy GPU in the same process. Set when an Event::awaitCompletion
+  // on this device times out; cleared automatically by Event::setStatus
+  // when any event on this device subsequently reaches CL_COMPLETE
+  // (i.e. once the GPU is observed to be making progress again) or
+  // explicitly via ClearAwaitDegraded() (e.g. from hipDeviceReset).
+  bool AwaitDegraded() const {
+    return await_degraded_.load(std::memory_order_relaxed);
+  }
+  void SetAwaitDegraded() {
+    await_degraded_.store(true, std::memory_order_relaxed);
+  }
+  void ClearAwaitDegraded() {
+    await_degraded_.store(false, std::memory_order_relaxed);
+  }
+
   virtual amd::Memory* GetArenaMemObj(const void* ptr, size_t& offset, size_t size = 0) {
     return nullptr;
   }
@@ -2128,6 +2147,10 @@ class Device : public RuntimeObject {
   uint64_t stack_size_{1024};       //!< Device stack size
   device::Memory* initial_heap_buffer_;   //!< Initial heap buffer
   uint64_t initial_heap_size_{HIP_INITIAL_DM_SIZE};  //!< Initial device heap size
+
+  //!< K-7.4 V17.5: per-device awaitCompletion fail-fast flag (see
+  //!< AwaitDegraded() / SetAwaitDegraded() / ClearAwaitDegraded() above).
+  mutable std::atomic<bool> await_degraded_{false};
  private:
   const Isa *isa_;                //!< Device isa
   bool IsTypeMatching(cl_device_type type, bool offlineDevices);
