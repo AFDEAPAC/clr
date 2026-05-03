@@ -161,6 +161,25 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
       signal();
     }
 
+    // K-7.5 V17.5: auto-clear per-device awaitCompletion-degraded latch
+    // (review-fix for BUG-2 sticky-flag-no-recovery). If any event on
+    // this device reaches CL_COMPLETE successfully (status == 0, NOT a
+    // negative error code) the GPU is observably making progress again,
+    // so clear the K-7.4 latch and let subsequent awaitCompletion calls
+    // re-enter the bounded wait path. This covers the transient-hang
+    // case where amdgpu's gpu_recover succeeds and the queue starts
+    // draining again. Negative status (CL error / cancel) is NOT
+    // treated as healthy progress and leaves the latch alone, so a
+    // hard-hung GPU keeps fail-fasting until the supervisor restarts
+    // the process or hipDeviceReset is called explicitly.
+    if (status == CL_COMPLETE) {
+      if (auto* q = command().queue()) {
+        if (q->device().AwaitDegraded()) {
+          q->device().ClearAwaitDegraded();
+        }
+      }
+    }
+
     if (profilingInfo().enabled_) {
       ClPrint(LOG_DEBUG, LOG_CMD, "Command %p complete (Wall: %ld, CPU: %ld, GPU: %ld us)",
         &command(),
