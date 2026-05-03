@@ -30,6 +30,8 @@
 #include "os/alloc.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 
@@ -159,6 +161,25 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
       signal();
     }
 
+    // K-7.5 V17.5: auto-clear per-device awaitCompletion-degraded latch
+    // (review-fix for BUG-2 sticky-flag-no-recovery). If any event on
+    // this device reaches CL_COMPLETE successfully (status == 0, NOT a
+    // negative error code) the GPU is observably making progress again,
+    // so clear the K-7.4 latch and let subsequent awaitCompletion calls
+    // re-enter the bounded wait path. This covers the transient-hang
+    // case where amdgpu's gpu_recover succeeds and the queue starts
+    // draining again. Negative status (CL error / cancel) is NOT
+    // treated as healthy progress and leaves the latch alone, so a
+    // hard-hung GPU keeps fail-fasting until the supervisor restarts
+    // the process or hipDeviceReset is called explicitly.
+    if (status == CL_COMPLETE) {
+      if (auto* q = command().queue()) {
+        if (q->device().AwaitDegraded()) {
+          q->device().ClearAwaitDegraded();
+        }
+      }
+    }
+
     if (profilingInfo().enabled_) {
       ClPrint(LOG_DEBUG, LOG_CMD, "Command %p complete (Wall: %ld, CPU: %ld, GPU: %ld us)",
         &command(),
@@ -232,9 +253,71 @@ void Event::processCallbacks(int32_t status) const {
 }
 
 static constexpr bool kCpuWait = true;
+
+namespace {
+// K-7.6 V17.5: opt-in deadline for Event::awaitCompletion (review-fix
+// CONCERN-1, env-semantic split).
+//
+// Activation gate (any of these enables the K-7 family):
+//   HIP_SERVICE_SURVIVAL=1   (preferred -- this is a CLR-layer fix)
+//   ROCR_SERVICE_SURVIVAL=1  (back-compat with PR #1 K-7.3 and the
+//                              shipped V17.5 customer ENV recipe)
+//
+// Deadline source (first non-empty wins):
+//   HIP_AWAIT_FAIL_MS        (preferred -- decouples CLR-layer wait
+//                              from ROCr-layer signal wait)
+//   ROCR_SIGNAL_WAIT_MAX_MS  (back-compat with PR #1 K-7.3 and the
+//                              shipped V17.5 customer ENV recipe)
+//   <default>                10000 ms
+//
+// Computed once on the first awaitCompletion call (function-local
+// static, thread-safe init via C++11 magic statics) so subsequent
+// setenv()s are not picked up. This matches the pre-K-7.6 behaviour
+// and avoids per-call getenv overhead on the hot path.
+static uint64_t ComputeAwaitTimeoutMs() {
+  const char* hip_surv = std::getenv("HIP_SERVICE_SURVIVAL");
+  const char* rocr_surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+  const bool gated_on = (hip_surv != nullptr && hip_surv[0] == '1') ||
+                        (rocr_surv != nullptr && rocr_surv[0] == '1');
+  if (!gated_on) {
+    return 0;
+  }
+  const char* candidates[] = { "HIP_AWAIT_FAIL_MS",
+                               "ROCR_SIGNAL_WAIT_MAX_MS" };
+  for (const char* name : candidates) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') {
+      continue;
+    }
+    char* end = nullptr;
+    const uint64_t ms = std::strtoull(v, &end, 10);
+    if (end != v && ms > 0) {
+      return ms;
+    }
+  }
+  return 10000;
+}
+}  // namespace
+
 // ================================================================================================
 bool Event::awaitCompletion() {
   if (status() > CL_COMPLETE) {
+    // K-7.3 / K-7.4: fail-fast if this Event's device is already known to
+    // be degraded (an earlier awaitCompletion on the same device timed out).
+    // K-7.4 V17.5: the degraded flag is per-device, NOT process-global, so
+    // a transient hang on one GPU does not fail-fast healthy events on
+    // other GPUs in the same process.
+    // K-7.6 V17.5: env knobs (gate + deadline) are split between HIP-layer
+    // and ROCr-layer names with back-compat fallback. See ComputeAwaitTimeoutMs().
+    static uint64_t await_timeout_ms = ComputeAwaitTimeoutMs();
+
+    auto* queue = command().queue();
+
+    if (await_timeout_ms && queue != nullptr &&
+        queue->device().AwaitDegraded()) {
+      return false;
+    }
+
     // Notifies the current command queue about waiting
     if (!notifyCmdQueue(kCpuWait)) {
       return false;
@@ -242,17 +325,35 @@ bool Event::awaitCompletion() {
 
     ClPrint(LOG_DEBUG, LOG_WAIT, "Waiting for event %p to complete, current status %d",
       this, status());
-    auto* queue = command().queue();
     if ((queue != nullptr) && queue->vdev()->ActiveWait()) {
+      auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(await_timeout_ms ? await_timeout_ms : UINT64_MAX/2);
       while (status() > CL_COMPLETE) {
+        if (await_timeout_ms &&
+            std::chrono::steady_clock::now() > deadline) {
+          queue->device().SetAwaitDegraded();
+          break;
+        }
         amd::Os::yield();
       }
     } else {
-      ScopedLock lock(lock_);
-
-      // Wait until the status becomes CL_COMPLETE or negative.
-      while (status() > CL_COMPLETE) {
-        lock_.wait();
+      if (await_timeout_ms) {
+        auto deadline_cv = std::chrono::steady_clock::now()
+                         + std::chrono::milliseconds(await_timeout_ms);
+        while (status() > CL_COMPLETE) {
+          if (std::chrono::steady_clock::now() > deadline_cv) {
+            if (queue != nullptr) {
+              queue->device().SetAwaitDegraded();
+            }
+            break;
+          }
+          amd::Os::yield();
+        }
+      } else {
+        ScopedLock lock(lock_);
+        while (status() > CL_COMPLETE) {
+          lock_.wait();
+        }
       }
     }
     ClPrint(LOG_DEBUG, LOG_WAIT, "Event %p wait completed", this);
