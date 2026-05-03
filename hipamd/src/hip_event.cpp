@@ -78,6 +78,20 @@ hipError_t Event::synchronize() {
   if (!hip_device->devices()[0]->IsHwEventReady(*event_, kWaitCompletion, flags_)) {
     event_->awaitCompletion();
   }
+  // K-7.8 V17.5: propagate the K-7.4 per-device awaitCompletion-degraded
+  // latch as hipErrorNotReady, mirroring K-7.7 in hipStreamSynchronize_common
+  // and hipDeviceSynchronize. Without this hop, hipEventSynchronize would
+  // silently return hipSuccess after a 4 s deadline -- letting the
+  // customer service consume stale data while believing the wait
+  // succeeded. The latch is auto-cleared by K-7.5 once any subsequent
+  // event on this device reaches CL_COMPLETE, so once the GPU drains
+  // the next call returns hipSuccess again. Latch is only ever set when
+  // HIP_SERVICE_SURVIVAL or ROCR_SERVICE_SURVIVAL is enabled (K-7.6 env
+  // gate), so legacy hipSuccess contract is bit-for-bit preserved with
+  // service-survival mode off.
+  if (hip_device->devices()[0]->AwaitDegraded()) {
+    return hipErrorNotReady;
+  }
   return hipSuccess;
 }
 

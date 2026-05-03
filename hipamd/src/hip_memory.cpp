@@ -300,6 +300,25 @@ hipError_t ihipFree(void *ptr) {
     if (sync_fail_ns != 0 && NowNs() - sync_start_ns > sync_fail_ns) {
       return hipErrorNotReady;
     }
+    // K-7.8 V17.5 (CONCERN-4): hipFree intentionally remains permissive
+    // when only the K-7.4 latch is set (without K-6 wall-clock elapsed
+    // exceeding sync_fail_ns). Customers' cleanup loop relies on hipFree
+    // succeeding so they can release CLR-side state and re-allocate from
+    // a fresh pool after a reject. Returning hipErrorNotReady here would
+    // break that loop and trap them with un-freeable buffers. Trade-off:
+    // the underlying VRAM may still be held by hung GPU work; if reused
+    // before the GPU drains, that's UAF on device. Customer is expected
+    // to (a) not reuse the freed VA in the same batch and (b) call
+    // hipDeviceReset() as a last resort if the GPU never recovers.
+    // Emit a single warning per occurrence so support can correlate
+    // post-mortem -- this does NOT block the free.
+    if (g_devices[device_id]->devices()[0]->AwaitDegraded()) {
+      ClPrint(LOG_WARNING, LOG_API,
+              "hipFree(%p) proceeding while device %d is in await-degraded "
+              "state; underlying VRAM may still be in use by a hung GPU. "
+              "See V17.5 K-7.8 CONCERN-4.",
+              ptr, device_id);
+    }
 
     // Find out if memory belongs to any memory pool
     if (!g_devices[device_id]->FreeMemory(memory_object, nullptr)) {
@@ -876,6 +895,17 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
   command->release();
   if (pageableCopyAccounted) {
     GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
+  }
+  // K-7.8 V17.5: if we waited synchronously above (isHostAsync == false)
+  // and Event::awaitCompletion deadline-tripped on this device while we
+  // were inside finish(), the K-7.4 per-device latch is now set. Surface
+  // that as hipErrorNotReady so customer code that does sync hipMemcpy
+  // -> read result does not silently consume stale data. Async paths
+  // (isHostAsync == true) preserve their original contract: they only
+  // enqueue and return, so a stale latch from a prior degraded op is
+  // not propagated at submit time.
+  if (!isHostAsync && stream.device().AwaitDegraded()) {
+    return hipErrorNotReady;
   }
   return hipSuccess;
 }
@@ -2689,8 +2719,17 @@ inline hipError_t ihipMemcpyCmdEnqueue(amd::Command* command, bool isAsync = fal
     return hipErrorOutOfMemory;
   }
   command->enqueue();
+  // K-7.8 V17.5: propagate K-7.4 per-device awaitCompletion-degraded
+  // latch from the sync path of every Param2D / Param3D / 2DArrayToArray
+  // / DtoA / AtoD / etc. variant that funnels through this helper. Same
+  // semantics as hipStreamSynchronize (K-7.7) and ihipMemcpy (K-7.8):
+  // sync path that swallows a deadline -> caller must learn about it.
+  amd::HostQueue* queue = command->queue();
   if (!isAsync) {
-    command->queue()->finish();
+    queue->finish();
+    if (queue != nullptr && queue->device().AwaitDegraded()) {
+      status = hipErrorNotReady;
+    }
   }
   command->release();
   return status;
@@ -3560,6 +3599,13 @@ hipError_t ihipMemset(void* dst, int64_t value, size_t valueSize, size_t sizeByt
       }
       command->release();
     }
+    // K-7.8 V17.5: propagate K-7.4 latch from the sync hipMemset path so
+    // a caller that fills then immediately reads does not silently see
+    // stale data on a device whose Event::awaitCompletion deadline-tripped.
+    if (!isAsync && hip_stream != nullptr &&
+        hip_stream->device().AwaitDegraded()) {
+      hip_error = hipErrorNotReady;
+    }
   } while (0);
   return hip_error;
 }
@@ -3730,6 +3776,11 @@ hipError_t ihipMemset3D(hipPitchedPtr pitchedDevPtr, int value, hipExtent extent
       hip_stream->finish();
     }
     command->release();
+  }
+  // K-7.8 V17.5: same latch propagation as ihipMemset above.
+  if (!isAsync && hip_stream != nullptr &&
+      hip_stream->device().AwaitDegraded()) {
+    return hipErrorNotReady;
   }
   return hipSuccess;
 }

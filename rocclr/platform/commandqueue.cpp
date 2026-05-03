@@ -159,11 +159,34 @@ void HostQueue::finish(bool cpu_wait) {
   static constexpr bool kWaitCompletion = true;
   const bool hwReady = device().IsHwEventReady(command->event(), kWaitCompletion);
   if (!hwReady) {
-    const char* survival = std::getenv("ROCR_SERVICE_SURVIVAL");
-    if (survival != nullptr && std::strcmp(survival, "1") == 0) {
+    // V17.4 service-survival early-return: if the underlying ROCr/HSA HW
+    // event already returned a not-ready (the ROCr signal-wait gave up at
+    // its own deadline -- e.g. ROCR_SIGNAL_WAIT_MAX_MS), short-circuit the
+    // CLR-layer awaitCompletion below and mark the command as errored.
+    //
+    // K-7.8 V17.5 update: also accept the new HIP_SERVICE_SURVIVAL gate
+    // (K-7.6 split CLR/ROCr env names; this path was previously gated only
+    // on the ROCr-layer name, which forced customers to keep both envs set
+    // even if they only meant to enable CLR-layer survival), and crucially
+    // also raise the K-7.4 per-device awaitCompletion-degraded latch so
+    // that K-7.7 + K-7.8's API-level exit checks (hipStreamSynchronize,
+    // hipDeviceSynchronize, hipEventSynchronize, ihipMemcpy, ihipMemset,
+    // ...) propagate hipErrorNotReady to the customer service. Without
+    // setting the latch, this V17.4 path silently returned hipSuccess to
+    // the application -- defeating the whole point of the 4 s reject
+    // contract: the app would believe its kernel/copy succeeded and
+    // happily consume a stale buffer.
+    const char* rocr_survival = std::getenv("ROCR_SERVICE_SURVIVAL");
+    const char* hip_survival = std::getenv("HIP_SERVICE_SURVIVAL");
+    const bool gated_on =
+        (rocr_survival != nullptr && std::strcmp(rocr_survival, "1") == 0) ||
+        (hip_survival  != nullptr && std::strcmp(hip_survival,  "1") == 0);
+    if (gated_on) {
       ClPrint(LOG_ERROR, LOG_CMD,
-              "ROCR_SERVICE_SURVIVAL: HW event wait failed; marking command as error");
+              "SERVICE_SURVIVAL: HW event wait failed; marking command as error "
+              "and raising per-device degraded latch");
       command->setStatus(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+      device().SetAwaitDegraded();
       return;
     }
   }
