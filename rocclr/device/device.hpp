@@ -2104,6 +2104,20 @@ class Device : public RuntimeObject {
   }
   void ClearAwaitDegraded() {
     await_degraded_.store(false, std::memory_order_relaxed);
+    // K-7.8 (CONCERN-4 throttle): once the latch clears, re-arm the
+    // permissive-hipFree warning so the next degraded episode emits
+    // exactly one log line (rather than spamming a tight cleanup loop).
+    await_warning_armed_.store(true, std::memory_order_relaxed);
+  }
+  // K-7.8 (CONCERN-4 throttle): returns true exactly once per degraded
+  // episode (latch set -> first AwaitWarningTryArm -> false on subsequent
+  // calls until ClearAwaitDegraded re-arms). Used by ihipFree to emit a
+  // single LOG_WARNING per episode regardless of how many buffers the
+  // customer's cleanup loop frees while the device is degraded.
+  bool AwaitWarningTryFire() {
+    bool armed = true;
+    return await_warning_armed_.compare_exchange_strong(
+        armed, false, std::memory_order_relaxed);
   }
 
   virtual amd::Memory* GetArenaMemObj(const void* ptr, size_t& offset, size_t size = 0) {
@@ -2151,6 +2165,12 @@ class Device : public RuntimeObject {
   //!< K-7.4 V17.5: per-device awaitCompletion fail-fast flag (see
   //!< AwaitDegraded() / SetAwaitDegraded() / ClearAwaitDegraded() above).
   mutable std::atomic<bool> await_degraded_{false};
+  // K-7.8 V17.5: companion latch for one-shot LOG_WARNING per degraded
+  // episode in ihipFree (CONCERN-4 throttle). Initially armed so the
+  // first time the device enters await_degraded_ the warning fires; the
+  // first AwaitWarningTryFire flips it to false (CAS). ClearAwaitDegraded
+  // re-arms it so the next degraded episode also emits one warning.
+  mutable std::atomic<bool> await_warning_armed_{true};
  private:
   const Isa *isa_;                //!< Device isa
   bool IsTypeMatching(cl_device_type type, bool offlineDevices);

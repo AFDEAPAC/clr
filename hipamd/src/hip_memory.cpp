@@ -310,14 +310,31 @@ hipError_t ihipFree(void *ptr) {
     // before the GPU drains, that's UAF on device. Customer is expected
     // to (a) not reuse the freed VA in the same batch and (b) call
     // hipDeviceReset() as a last resort if the GPU never recovers.
-    // Emit a single warning per occurrence so support can correlate
-    // post-mortem -- this does NOT block the free.
-    if (g_devices[device_id]->devices()[0]->AwaitDegraded()) {
+    //
+    // Throttle: AwaitWarningTryFire is a one-shot CAS that fires exactly
+    // once per degraded episode (re-armed by ClearAwaitDegraded inside
+    // K-7.5 auto-clear). Without the throttle a tight cleanup loop
+    // freeing thousands of buffers while the device is still degraded
+    // would spam the log; with it we emit one line per episode, which is
+    // exactly what support needs to correlate post-mortem.
+    //
+    // No additional hang: this code path is only reached when (a) the
+    // K-6 wall-clock check above did NOT fire (elapsed <= sync_fail_ns),
+    // which means SyncAllStreamsBounded already returned within budget.
+    // The TryFire CAS + ClPrint are pure CPU-bound work in the µs range.
+    amd::Device* dev = g_devices[device_id]->devices()[0];
+    if (dev->AwaitDegraded() && dev->AwaitWarningTryFire()) {
       ClPrint(LOG_WARNING, LOG_API,
-              "hipFree(%p) proceeding while device %d is in await-degraded "
-              "state; underlying VRAM may still be in use by a hung GPU. "
-              "See V17.5 K-7.8 CONCERN-4.",
-              ptr, device_id);
+              "hipFree: device %d entered await-degraded; subsequent frees "
+              "this episode will proceed without further warnings until the "
+              "device drains (K-7.5 auto-clear) or is reset. Underlying VRAM "
+              "may still be referenced by an unfinished GPU command. "
+              "First freed VA in this episode: %p. SyncAllStreamsBounded "
+              "elapsed: %llu ms / budget %llu ms. See V17.5 K-7.8 CONCERN-4.",
+              device_id, ptr,
+              static_cast<unsigned long long>(
+                  (NowNs() - sync_start_ns) / 1000000ULL),
+              static_cast<unsigned long long>(sync_fail_ns / 1000000ULL));
     }
 
     // Find out if memory belongs to any memory pool
