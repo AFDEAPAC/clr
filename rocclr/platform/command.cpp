@@ -254,6 +254,51 @@ void Event::processCallbacks(int32_t status) const {
 
 static constexpr bool kCpuWait = true;
 
+namespace {
+// K-7.6 V17.5: opt-in deadline for Event::awaitCompletion (review-fix
+// CONCERN-1, env-semantic split).
+//
+// Activation gate (any of these enables the K-7 family):
+//   HIP_SERVICE_SURVIVAL=1   (preferred -- this is a CLR-layer fix)
+//   ROCR_SERVICE_SURVIVAL=1  (back-compat with PR #1 K-7.3 and the
+//                              shipped V17.5 customer ENV recipe)
+//
+// Deadline source (first non-empty wins):
+//   HIP_AWAIT_FAIL_MS        (preferred -- decouples CLR-layer wait
+//                              from ROCr-layer signal wait)
+//   ROCR_SIGNAL_WAIT_MAX_MS  (back-compat with PR #1 K-7.3 and the
+//                              shipped V17.5 customer ENV recipe)
+//   <default>                10000 ms
+//
+// Computed once on the first awaitCompletion call (function-local
+// static, thread-safe init via C++11 magic statics) so subsequent
+// setenv()s are not picked up. This matches the pre-K-7.6 behaviour
+// and avoids per-call getenv overhead on the hot path.
+static uint64_t ComputeAwaitTimeoutMs() {
+  const char* hip_surv = std::getenv("HIP_SERVICE_SURVIVAL");
+  const char* rocr_surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+  const bool gated_on = (hip_surv != nullptr && hip_surv[0] == '1') ||
+                        (rocr_surv != nullptr && rocr_surv[0] == '1');
+  if (!gated_on) {
+    return 0;
+  }
+  const char* candidates[] = { "HIP_AWAIT_FAIL_MS",
+                               "ROCR_SIGNAL_WAIT_MAX_MS" };
+  for (const char* name : candidates) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || *v == '\0') {
+      continue;
+    }
+    char* end = nullptr;
+    const uint64_t ms = std::strtoull(v, &end, 10);
+    if (end != v && ms > 0) {
+      return ms;
+    }
+  }
+  return 10000;
+}
+}  // namespace
+
 // ================================================================================================
 bool Event::awaitCompletion() {
   if (status() > CL_COMPLETE) {
@@ -262,13 +307,9 @@ bool Event::awaitCompletion() {
     // K-7.4 V17.5: the degraded flag is per-device, NOT process-global, so
     // a transient hang on one GPU does not fail-fast healthy events on
     // other GPUs in the same process.
-    static uint64_t await_timeout_ms = []() -> uint64_t {
-      const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
-      if (!surv || surv[0] != '1') return 0;
-      const char* ms_str = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
-      uint64_t ms = ms_str ? std::strtoull(ms_str, nullptr, 10) : 10000;
-      return ms ? ms : 10000;
-    }();
+    // K-7.6 V17.5: env knobs (gate + deadline) are split between HIP-layer
+    // and ROCr-layer names with back-compat fallback. See ComputeAwaitTimeoutMs().
+    static uint64_t await_timeout_ms = ComputeAwaitTimeoutMs();
 
     auto* queue = command().queue();
 
