@@ -171,7 +171,12 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
     // draining again. Negative status (CL error / cancel) is NOT
     // treated as healthy progress and leaves the latch alone, so a
     // hard-hung GPU keeps fail-fasting until the supervisor restarts
-    // the process or hipDeviceReset is called explicitly.
+    // the process. NOTE: we deliberately do NOT tie this latch into
+    // hipDeviceReset() -- that API releases all mem pools and destroys
+    // all streams, which would discard the customer's pre-loaded model
+    // weights. Service-survival semantics rely on the auto-clear above
+    // plus per-batch hipErrorNotReady rejects, so the GPU context stays
+    // intact between transient hangs.
     if (status == CL_COMPLETE) {
       if (auto* q = command().queue()) {
         if (q->device().AwaitDegraded()) {

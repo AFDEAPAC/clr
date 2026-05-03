@@ -358,6 +358,28 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
   }
   // Release freed memory for all memory pools on the device
   hip_stream->GetDevice()->ReleaseFreedMemory();
+  // K-7.7 V17.5: if Event::awaitCompletion tripped its K-7.2 deadline
+  // somewhere inside finish() above (i.e. K-7.4 set the per-device
+  // await_degraded_ latch on this device), propagate that as
+  // hipErrorNotReady so the customer service can reject this batch
+  // instead of silently consuming a stale GPU buffer. Without this
+  // hop the previous V17.5 chain swallowed the deadline -- finish()
+  // is void, so hipStreamSynchronize_common always returned hipSuccess
+  // and the caller had no way to know the wait was abandoned.
+  //
+  // The latch is only ever set when HIP_SERVICE_SURVIVAL (or the
+  // back-compat ROCR_SERVICE_SURVIVAL) is enabled (see K-7.6
+  // ComputeAwaitTimeoutMs() in rocclr/platform/command.cpp), so when
+  // service-survival mode is off the latch stays clear and this branch
+  // never fires -- legacy hipSuccess contract is preserved bit-for-bit.
+  //
+  // K-7.5 will auto-clear the latch as soon as any subsequent event on
+  // this device reaches CL_COMPLETE, so once the GPU drains the next
+  // hipStreamSynchronize starts succeeding again without operator
+  // intervention.
+  if (hip_stream->device().AwaitDegraded()) {
+    return hipErrorNotReady;
+  }
   return hipSuccess;
 }
 

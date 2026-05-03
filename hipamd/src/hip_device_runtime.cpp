@@ -636,14 +636,25 @@ hipError_t hipDeviceSynchronize() {
   CHECK_SUPPORTED_DURING_CAPTURE();
   constexpr bool kDoWaitForCpu = false;
   // K-6.2 V17.5: bound the SyncAllStreams loop with the same HIP_FREE_SYNC_FAIL_MS
-  // as K-6 (hipFree) and K-6.1 (hipHostUnregister/hipFreeArray/...). No early-return
-  // on timeout to preserve hipSuccess contract -- caller must rely on subsequent
-  // op return codes if it cares about completeness.
+  // as K-6 (hipFree) and K-6.1 (hipHostUnregister/hipFreeArray/...).
+  // K-7.7 V17.5 update: K-6.2 originally documented "no early-return on timeout
+  // to preserve hipSuccess contract". K-7.7 narrows that exception: when the
+  // K-7.4 await_degraded_ latch fires on the current device (which only
+  // happens with HIP_SERVICE_SURVIVAL / ROCR_SERVICE_SURVIVAL enabled, see
+  // K-7.6 ComputeAwaitTimeoutMs() in rocclr/platform/command.cpp), we
+  // propagate hipErrorNotReady so the customer service rejects the batch
+  // rather than silently believing all device streams drained. K-6.2's
+  // wall-clock check stays advisory because it can fire even when streams
+  // succeeded (e.g. a long stream simply finished after sync_ns); the
+  // K-7.4 latch is the authoritative "we abandoned the wait" signal.
   const uint64_t sync_ns = HipDevSyncFailNs();
   if (sync_ns != 0) {
     hip::getCurrentDevice()->SyncAllStreamsBounded(kDoWaitForCpu, sync_ns);
   } else {
     hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
+  }
+  if (hip::getCurrentDevice()->devices()[0]->AwaitDegraded()) {
+    HIP_RETURN(hipErrorNotReady);
   }
   HIP_RETURN(hipSuccess);
 }
