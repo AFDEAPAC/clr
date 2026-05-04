@@ -261,6 +261,10 @@ class Command : public Event {
   uint8_t* gpuPacket_ = nullptr;     //!< GPU packet to capture, when graph capturing is enabled
   address kernArgOffset_ = nullptr;  //!< KernelArg buffer to used when graph capturing is enabled
   std::string* capturedKernelName_ = nullptr;  //!< Kenrnel under capture
+  //!< K-7.5.1 V17.5: degraded epoch at enqueue time. Used by K-7.5
+  //!< auto-clear to reject SDMA completions from the current degraded epoch.
+  uint64_t enqueue_degraded_epoch_{0};
+
  protected:
   bool cpu_wait_ = false;         //!< If true, then the command was issued for CPU/GPU sync
 
@@ -331,6 +335,10 @@ class Command : public Event {
 
   //! Enqueue this command into the associated command queue.
   void enqueue();
+
+  //! K-7.5.1 V17.5: degraded epoch snapshot at enqueue time.
+  uint64_t enqueueDegradedEpoch() const { return enqueue_degraded_epoch_; }
+  void setEnqueueDegradedEpoch(uint64_t e) { enqueue_degraded_epoch_ = e; }
 
   //! Return the event encapsulating this command's status.
   const Event& event() const { return *this; }

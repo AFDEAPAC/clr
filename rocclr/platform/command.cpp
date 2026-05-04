@@ -180,7 +180,17 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
     if (status == CL_COMPLETE) {
       if (auto* q = command().queue()) {
         if (q->device().AwaitDegraded()) {
-          q->device().ClearAwaitDegraded();
+          // K-7.5.1 V17.5: only clear if this command was enqueued BEFORE
+          // the current degraded epoch. Commands enqueued during degradation
+          // can complete via SDMA (non-blocked engine) and must NOT clear
+          // the latch — that would create a TOCTOU race where subsequent
+          // sync APIs (hipMemset, hipMemcpy) see a cleared latch and bypass
+          // their entry-gates. Pre-degradation completions (e.g. the hung
+          // kernel finally finishing after gpu_recover) are genuine recovery
+          // signals and DO clear the latch.
+          if (command().enqueueDegradedEpoch() < q->device().AwaitDegradedEpoch()) {
+            q->device().ClearAwaitDegraded();
+          }
         }
       }
     }
@@ -457,6 +467,10 @@ void Command::releaseResources() {
 // ================================================================================================
 void Command::enqueue() {
   assert(queue_ != NULL && "Cannot be enqueued");
+
+  // K-7.5.1 V17.5: snapshot the degraded epoch at enqueue time so K-7.5
+  // auto-clear can distinguish pre-degradation commands from in-degradation ones.
+  setEnqueueDegradedEpoch(queue_->device().AwaitDegradedEpoch());
 
   if (Agent::shouldPostEventEvents() && type_ != 0) {
     Agent::postEventCreate(as_cl(static_cast<Event*>(this)), type_);

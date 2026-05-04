@@ -327,8 +327,11 @@ bool Device::StreamCaptureBlocking() {
 bool Device::existsActiveStreamForDevice() {
   amd::ScopedLock lock(streamSetLock);
   for (const auto& active_stream : streamSet) {
-    if (active_stream->GetQueueStatus()) {
-      return true;
+    amd::Command* cmd = active_stream->getLastQueuedCommand(true);
+    if (cmd != nullptr) {
+      bool pending = (cmd->status() != CL_COMPLETE);
+      cmd->release();
+      if (pending) return true;
     }
   }
   return false;

@@ -38,6 +38,7 @@
 #include "os/os.hpp"
 #include "hsa/amd_hsa_kernel_code.h"
 #include "hsa/amd_hsa_queue.h"
+#include <chrono>
 #include "hsa/amd_hsa_signal.h"
 
 #include <fstream>
@@ -887,8 +888,21 @@ bool VirtualGPU::dispatchGenericAqlPacket(
   }
 
   // Make sure the slot is free for usage
-  while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= sw_queue_size) {
-    amd::Os::yield();
+  {
+    auto aql_spin_t0 = std::chrono::steady_clock::now();
+    while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= sw_queue_size) {
+      amd::Os::yield();
+      bool bail = dev().AwaitDegraded();
+      if (!bail) {
+        auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - aql_spin_t0).count();
+        bail = (aql_ms >= 5000);
+      }
+      if (bail) {
+        const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
+        break;
+      }
+    }
   }
 
   // Add blocking command if the original value of read index was behind of the queue size.
@@ -1073,7 +1087,28 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
     addSystemScope_ = false;
   }
 
-  while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= queueMask);
+  {
+    auto aql_spin_t0 = std::chrono::steady_clock::now();
+    while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+      amd::Os::yield();
+      bool bail = dev().AwaitDegraded();
+      if (!bail) {
+        auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - aql_spin_t0).count();
+        bail = (aql_ms >= 5000);
+      }
+      if (bail) {
+        hsa_barrier_and_packet_t* nop_loc =
+            &(reinterpret_cast<hsa_barrier_and_packet_t*>(
+                gpu_queue_->base_address))[index & queueMask];
+        memset(nop_loc, 0, sizeof(*nop_loc));
+        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
+        const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
+        return;
+      }
+    }
+  }
   hsa_barrier_and_packet_t* aql_loc =
     &(reinterpret_cast<hsa_barrier_and_packet_t*>(gpu_queue_->base_address))[index & queueMask];
   *aql_loc = barrier_packet_;
@@ -1151,7 +1186,28 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
   }
 
   uint64_t index = hsa_queue_add_write_index_screlease(gpu_queue_, 1);
-  while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= queueMask);
+  {
+    auto aql_spin_t0 = std::chrono::steady_clock::now();
+    while ((index - hsa_queue_load_read_index_scacquire(gpu_queue_)) >= queueMask) {
+      amd::Os::yield();
+      bool bail = dev().AwaitDegraded();
+      if (!bail) {
+        auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - aql_spin_t0).count();
+        bail = (aql_ms >= 5000);
+      }
+      if (bail) {
+        hsa_amd_barrier_value_packet_t* nop_loc =
+            &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
+                gpu_queue_->base_address))[index & queueMask];
+        memset(nop_loc, 0, sizeof(*nop_loc));
+        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
+        const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
+        return;
+      }
+    }
+  }
   hsa_amd_barrier_value_packet_t* aql_loc = &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
       gpu_queue_->base_address))[index & queueMask];
   *aql_loc = barrier_value_packet_;

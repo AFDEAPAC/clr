@@ -2101,6 +2101,10 @@ class Device : public RuntimeObject {
   }
   void SetAwaitDegraded() {
     await_degraded_.store(true, std::memory_order_relaxed);
+    await_degraded_epoch_.fetch_add(1, std::memory_order_relaxed);
+  }
+  uint64_t AwaitDegradedEpoch() const {
+    return await_degraded_epoch_.load(std::memory_order_relaxed);
   }
   void ClearAwaitDegraded() {
     await_degraded_.store(false, std::memory_order_relaxed);
@@ -2165,6 +2169,11 @@ class Device : public RuntimeObject {
   //!< K-7.4 V17.5: per-device awaitCompletion fail-fast flag (see
   //!< AwaitDegraded() / SetAwaitDegraded() / ClearAwaitDegraded() above).
   mutable std::atomic<bool> await_degraded_{false};
+  //!< K-7.5.1 V17.5: monotonic epoch incremented by SetAwaitDegraded().
+  //!< Used by K-7.5 auto-clear to distinguish pre-degradation commands
+  //!< (whose completion signals genuine recovery) from commands enqueued
+  //!< during degradation (whose SDMA completion is not a recovery signal).
+  mutable std::atomic<uint64_t> await_degraded_epoch_{0};
   // K-7.8 V17.5: companion latch for one-shot LOG_WARNING per degraded
   // episode in ihipFree (CONCERN-4 throttle). Initially armed so the
   // first time the device enters await_degraded_ the warning fires; the

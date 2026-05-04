@@ -60,14 +60,19 @@ if(HIP_PLATFORM STREQUAL "amd" )
               ${CMAKE_LIB_TYPE}
               DESTINATION ${CMAKE_INSTALL_LIBDIR}
               COMPONENT ${COMPONENT_NAME})
-   install(TARGETS hiprtc
-              ${CMAKE_LIB_TYPE}
-              DESTINATION ${CMAKE_INSTALL_LIBDIR}
-              COMPONENT ${COMPONENT_NAME})
-   install(TARGETS hiprtc-builtins
-              ${CMAKE_LIB_TYPE}
-              DESTINATION ${CMAKE_INSTALL_LIBDIR}
-              COMPONENT ${COMPONENT_NAME})
+   # hiprtc targets disabled for K-7.x build-only
+   if(TARGET hiprtc)
+     install(TARGETS hiprtc
+                ${CMAKE_LIB_TYPE}
+                DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                COMPONENT ${COMPONENT_NAME})
+   endif()
+   if(TARGET hiprtc-builtins)
+     install(TARGETS hiprtc-builtins
+                ${CMAKE_LIB_TYPE}
+                DESTINATION ${CMAKE_INSTALL_LIBDIR}
+                COMPONENT ${COMPONENT_NAME})
+   endif()
 
 #TODO:This do not belong in BINARY package.
 #Keeping it as is for now
@@ -78,8 +83,10 @@ install ( EXPORT hip-targets  FILE hip-targets.cmake NAMESPACE hip:: DESTINATION
 install(FILES ${CMAKE_BINARY_DIR}/hipamd/src/hip-lang-config.cmake ${CMAKE_BINARY_DIR}/hipamd/src/hip-lang-config-version.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hip-lang COMPONENT dev)
 install ( EXPORT hip-lang-targets  FILE hip-lang-targets.cmake NAMESPACE hip-lang:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hip-lang  COMPONENT dev)
 
-install(FILES ${CMAKE_BINARY_DIR}/hipamd/hiprtc-config.cmake ${CMAKE_BINARY_DIR}/hipamd/hiprtc-config-version.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hiprtc COMPONENT dev)
-install ( EXPORT hiprtc-targets  FILE hiprtc-targets.cmake NAMESPACE hiprtc:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hiprtc  COMPONENT dev)
+if(TARGET hiprtc)
+  install(FILES ${CMAKE_BINARY_DIR}/hipamd/hiprtc-config.cmake ${CMAKE_BINARY_DIR}/hipamd/hiprtc-config-version.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hiprtc COMPONENT dev)
+  install ( EXPORT hiprtc-targets  FILE hiprtc-targets.cmake NAMESPACE hiprtc:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/hiprtc  COMPONENT dev)
+endif()
 
 endif()#End HIP_PLATFORM = "amd"
 #End bianry files install
@@ -91,7 +98,9 @@ if(NOT WIN32)
     list(FILTER BIN_FILES EXCLUDE REGEX ".bat$")
 endif()
 foreach(binFile ${BIN_FILES})
-    install(PROGRAMS ${binFile} DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT dev)
+    if(NOT IS_DIRECTORY ${binFile})
+        install(PROGRAMS ${binFile} DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT dev)
+    endif()
 endforeach()
 unset(BIN_FILES)
 

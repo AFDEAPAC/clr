@@ -530,6 +530,10 @@ hipError_t hipStreamQuery_common(hipStream_t stream) {
   bool wait = (stream == nullptr) ? true : false;
   hip::Stream* hip_stream = hip::getStream(stream, wait);
 
+  if (hip_stream->device().AwaitDegraded()) {
+    return hipErrorNotReady;
+  }
+
   if (hip_stream->vdev()->isFenceDirty()) {
     amd::Command* command = new amd::Marker(*hip_stream, kMarkerDisableFlush);
     if (command != nullptr) {

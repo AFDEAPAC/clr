@@ -205,10 +205,10 @@ if(__HIP_ENABLE_PCH)
 endif()
 
 set(HIPRTC_OBJECTS)
-# Add hiprtc
-add_subdirectory(hiprtc)
+# hiprtc disabled: we only need libamdhip64.so for K-7.x validation.
+# add_subdirectory(hiprtc)
 
-if(NOT WIN32)
+if(FALSE AND NOT WIN32)
   target_compile_definitions(amdhip64 PRIVATE __HIP_ENABLE_RTC)
   if(BUILD_SHARED_LIBS)
     target_link_libraries(amdhip64 PRIVATE ${HIPRTC_OBJECTS})

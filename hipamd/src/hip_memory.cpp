@@ -324,7 +324,7 @@ hipError_t ihipFree(void *ptr) {
     // The TryFire CAS + ClPrint are pure CPU-bound work in the µs range.
     amd::Device* dev = g_devices[device_id]->devices()[0];
     if (dev->AwaitDegraded() && dev->AwaitWarningTryFire()) {
-      ClPrint(LOG_WARNING, LOG_API,
+      ClPrint(amd::LOG_WARNING, amd::LOG_API,
               "hipFree: device %d entered await-degraded; subsequent frees "
               "this episode will proceed without further warnings until the "
               "device drains (K-7.5 auto-clear) or is reset. Underlying VRAM "
@@ -850,6 +850,22 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
     if (status != hipSuccess) {
       return status;
     }
+  }
+
+  // K-7.8.3 V17.5: entry-gate for sync DtoH and pageable H2D on a
+  // degraded device. DtoH copies complete asynchronously via SDMA even
+  // when compute is hung; their completion triggers K-7.5 auto-clear,
+  // creating a TOCTOU race for subsequent sync APIs (hipMemset sees a
+  // cleared latch). Pageable H2D can hang in WaitRelaxed under RDMA
+  // quota exhaustion. Pinned H2D is allowed through — it's needed for
+  // control operations like releasing hung kernels.
+  const bool isCopyFromDevice = (srcMemory != nullptr && dstMemory == nullptr);
+  if (!isHostAsync && (isCopyFromDevice || isPageableH2D) &&
+      stream.device().AwaitDegraded()) {
+    if (pageableCopyAccounted) {
+      GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
+    }
+    return hipErrorNotReady;
   }
 
   if (srcMemory == nullptr && dstMemory == nullptr) {
@@ -3604,6 +3620,16 @@ hipError_t ihipMemset(void* dst, int64_t value, size_t valueSize, size_t sizeByt
     }
     std::vector<amd::Command*> commands;
     hip::Stream* hip_stream = hip::getStream(stream);
+
+    // K-7.8.2 V17.5: entry-gate for device memset. The spec promotes
+    // isAsync=true for device destinations, but the public API (hipMemset)
+    // is sync. Check BEFORE enqueue to avoid a TOCTOU race where a fast
+    // SDMA fill triggers K-7.5 auto-clear before we can observe the latch.
+    if (hip_stream != nullptr && hip_stream->device().AwaitDegraded()) {
+      hip_error = hipErrorNotReady;
+      break;
+    }
+
     hip_error = ihipMemsetCommand(commands, dst, value, valueSize, sizeBytes, hip_stream);
     if (hip_error != hipSuccess) {
       break;
@@ -3782,6 +3808,12 @@ hipError_t ihipMemset3D(hipPitchedPtr pitchedDevPtr, int value, hipExtent extent
     }
   }
   hip::Stream* hip_stream = hip::getStream(stream);
+
+  // K-7.8.2 V17.5: entry-gate (same as ihipMemset).
+  if (hip_stream != nullptr && hip_stream->device().AwaitDegraded()) {
+    return hipErrorNotReady;
+  }
+
   std::vector<amd::Command*> commands;
   status = ihipMemset3DCommand(commands, pitchedDevPtr, value, extent, hip_stream);
   if (status != hipSuccess) {
