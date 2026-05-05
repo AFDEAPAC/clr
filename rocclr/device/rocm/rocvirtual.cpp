@@ -2836,7 +2836,6 @@ void VirtualGPU::submitMigrateMemObjects(amd::MigrateMemObjectsCommand& vcmd) {
 // ================================================================================================
 static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
   if (status != HSA_STATUS_SUCCESS && status != HSA_STATUS_INFO_BREAK) {
-    // Abort on device exceptions.
     const char* errorMsg = 0;
     hsa_status_string(status, &errorMsg);
     if (status == HSA_STATUS_ERROR_OUT_OF_RESOURCES) {
@@ -2854,6 +2853,18 @@ static void callbackQueue(hsa_status_t status, hsa_queue_t* queue, void* data) {
       ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
         "Callback: Queue %p aborting with error : %s code: 0x%x", queue->base_address,
         errorMsg, status);
+    }
+
+    const char* rocr_surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+    const char* hip_surv = std::getenv("HIP_SERVICE_SURVIVAL");
+    if ((rocr_surv && rocr_surv[0] == '1') || (hip_surv && hip_surv[0] == '1')) {
+      ClPrint(amd::LOG_NONE, amd::LOG_ALWAYS,
+              "SERVICE_SURVIVAL: Queue %p error suppressed (would abort): %s code: 0x%x",
+              queue->base_address, errorMsg, status);
+      VirtualGPU* vgpu = reinterpret_cast<VirtualGPU*>(data);
+      const_cast<amd::Device&>(
+          static_cast<const amd::Device&>(vgpu->dev())).SetAwaitDegraded();
+      return;
     }
     abort();
   }
