@@ -230,6 +230,50 @@ static uint64_t FreeSyncFailNs() {
   const uint64_t ms = EnvU64("HIP_FREE_SYNC_FAIL_MS", 0);
   return ms == 0 ? 0 : ms * 1000000ULL;
 }
+
+struct DeferredFreeEntry {
+  void* ptr;
+  int device_id;
+  uint64_t enqueue_ns;
+};
+
+static std::mutex deferred_free_mu_;
+static std::vector<DeferredFreeEntry> deferred_free_queue_;
+
+static size_t DeferFree(void* ptr, int device_id) {
+  std::lock_guard<std::mutex> lk(deferred_free_mu_);
+  deferred_free_queue_.push_back({ptr, device_id, NowNs()});
+  return deferred_free_queue_.size();
+}
+
+static void DrainDeferredFrees() {
+  std::lock_guard<std::mutex> lk(deferred_free_mu_);
+  if (deferred_free_queue_.empty()) return;
+
+  auto it = deferred_free_queue_.begin();
+  while (it != deferred_free_queue_.end()) {
+    if (it->device_id >= 0 &&
+        static_cast<size_t>(it->device_id) < g_devices.size() &&
+        g_devices[it->device_id] != nullptr &&
+        !g_devices[it->device_id]->devices()[0]->AwaitDegraded()) {
+      size_t offset = 0;
+      amd::Memory* mem = getMemoryObject(it->ptr, offset);
+      if (mem) {
+        if (!g_devices[it->device_id]->FreeMemory(mem, nullptr)) {
+          if (mem->isInterop()) {
+            amd::MemObjMap::RemoveMemObj(it->ptr);
+            mem->release();
+          } else {
+            amd::SvmBuffer::free(mem->getContext(), it->ptr);
+          }
+        }
+      }
+      it = deferred_free_queue_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
 }
 
 amd::Monitor hipArraySetLock{"Guards global hipArray set"};
@@ -275,6 +319,8 @@ hipError_t ihipFree(void *ptr) {
     return hipSuccess;
   }
 
+  DrainDeferredFrees();
+
   size_t offset = 0;
   amd::Memory* memory_object = getMemoryObject(ptr, offset);
   if (memory_object != nullptr) {
@@ -286,10 +332,6 @@ hipError_t ihipFree(void *ptr) {
     if (FreeRejectOnActive() && g_devices[device_id]->existsActiveStreamForDevice()) {
       return hipErrorNotReady;
     }
-    // K-6 V17.5: bound SyncAllStreams wall-clock to HIP_FREE_SYNC_FAIL_MS so
-    // hipFree cannot stall for N x ROCR_SIGNAL_WAIT_MAX_MS when there are
-    // many poisoned streams. If sync_fail_ns is 0 we fall through to the
-    // unbounded version exactly like the pre-K6 build.
     const uint64_t sync_start_ns = NowNs();
     const uint64_t sync_fail_ns = FreeSyncFailNs();
     if (sync_fail_ns != 0) {
@@ -298,6 +340,10 @@ hipError_t ihipFree(void *ptr) {
       g_devices[device_id]->SyncAllStreams();
     }
     if (sync_fail_ns != 0 && NowNs() - sync_start_ns > sync_fail_ns) {
+      size_t qsz = DeferFree(ptr, device_id);
+      ClPrint(amd::LOG_WARNING, amd::LOG_API,
+              "hipFree: deferred free for %p (device %d), queue size %zu",
+              ptr, device_id, qsz);
       return hipErrorNotReady;
     }
     // K-7.8 V17.5 (CONCERN-4): hipFree intentionally remains permissive
