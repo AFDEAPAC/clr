@@ -1101,8 +1101,15 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
         hsa_barrier_and_packet_t* nop_loc =
             &(reinterpret_cast<hsa_barrier_and_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
+        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
+        // Previously stored 0 = HSA_PACKET_TYPE_VENDOR_SPECIFIC, which has no
+        // handler and triggers HSA_STATUS_ERROR_INVALID_PACKET_FORMAT 0x1009
+        // (e.g. observed in sdma_suballoc reproducer).
         memset(nop_loc, 0, sizeof(*nop_loc));
-        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            reinterpret_cast<uint16_t*>(nop_loc),
+            static_cast<uint16_t>(HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE),
+            __ATOMIC_RELEASE);
         hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
         return;
@@ -1200,8 +1207,14 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
         hsa_amd_barrier_value_packet_t* nop_loc =
             &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
+        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
+        // Previously stored 0 = HSA_PACKET_TYPE_VENDOR_SPECIFIC, which has no
+        // handler and triggers HSA_STATUS_ERROR_INVALID_PACKET_FORMAT 0x1009.
         memset(nop_loc, 0, sizeof(*nop_loc));
-        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        __atomic_store_n(
+            reinterpret_cast<uint16_t*>(nop_loc),
+            static_cast<uint16_t>(HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE),
+            __ATOMIC_RELEASE);
         hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
         return;
