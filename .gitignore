@@ -44,3 +44,9 @@ install/
 # Editor temp files
 *.swp
 *.swo
+build_632/
+build_6_3/
+build/
+*.o
+*.so
+*.so.*
