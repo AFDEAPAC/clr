@@ -590,6 +590,13 @@ bool VirtualGPU::HwQueueTracker::CpuWaitForSignal(ProfilingSignal* signal) {
     if (!WaitForSignal(signal->signal_, gpu_.ActiveWait())) {
       LogPrintfError("Failed signal [0x%lx] wait", signal->signal_);
       gpu_.MarkServiceSurvivalFailure();
+      // K-7.9 V17.5: also set per-device AwaitDegraded latch so that
+      // K-7.4/K-7.7/K-7.8.x entry-gates can fast-fail subsequent sync APIs
+      // (hipMemcpy/hipMemset/hipEventSynchronize/hipStreamSynchronize). The
+      // bounded WaitForSignal above returns false on cgroup-induced hang;
+      // surfacing that to the device latch is what unblocks the caller.
+      const_cast<amd::Device&>(static_cast<const amd::Device&>(
+          gpu_.device())).SetAwaitDegraded();
       return false;
     }
     signal->flags_.done_ = true;

@@ -49,6 +49,17 @@ constexpr static uint64_t kUnlimitedWait = std::numeric_limits<uint64_t>::max();
 // then just wait instead of adding dependency wait signal.
 constexpr static uint64_t kForcedTimeout10us = 10;
 
+// K-7.9 V17.5: read HIP_AWAIT_FAIL_MS once. 0 = disabled (legacy unbounded);
+// non-zero = bound the BLOCKED fallback wait. Default 4000 ms matches the
+// rest of the K-7.x service-survival deadline budget.
+inline uint64_t WaitForSignalBlockedFailMs() {
+  static const uint64_t cached = []{
+    const char* s = getenv("HIP_AWAIT_FAIL_MS");
+    return s ? strtoull(s, nullptr, 10) : 4000ULL;
+  }();
+  return cached;
+}
+
 template <bool active_wait_timeout = false>
 inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool forced_wait = false) {
   if (hsa_signal_load_relaxed(signal) > 0) {
@@ -76,9 +87,23 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
       ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host blocked wait for Signal = (0x%lx)",
               signal.handle);
 
-      // Wait until the completion with CPU suspend
+      // K-7.9 V17.5: bound the BLOCKED fallback wait by HIP_AWAIT_FAIL_MS
+      // (default 4000 ms). Previously this was kUnlimitedWait, which under
+      // cgroup memory pressure / RDMA pin saturation caused permanent hang
+      // (customer scenario: hipMemcpy H2D pageable -> kb->copyBuffer ->
+      // CpuWaitForSignal -> WaitForSignal -> infinite block).
+      // HIP_AWAIT_FAIL_MS=0 preserves legacy unbounded behavior.
+      const uint64_t fail_ms = WaitForSignalBlockedFailMs();
+      const uint64_t deadline_ns = (fail_ms == 0)
+          ? kUnlimitedWait
+          : fail_ms * 1000000ULL;
       if (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
-                                    kUnlimitedWait, HSA_WAIT_STATE_BLOCKED) != 0) {
+                                    deadline_ns, HSA_WAIT_STATE_BLOCKED) != 0) {
+        if (fail_ms != 0) {
+          ClPrint(amd::LOG_WARNING, amd::LOG_SIG,
+                  "K-7.9 WaitForSignal BLOCKED timeout after %llu ms — signal=(0x%lx)",
+                  static_cast<unsigned long long>(fail_ms), signal.handle);
+        }
         return false;
       }
     }
