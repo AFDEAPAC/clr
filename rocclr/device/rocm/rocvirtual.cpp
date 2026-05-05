@@ -1102,7 +1102,9 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
             &(reinterpret_cast<hsa_barrier_and_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
         memset(nop_loc, 0, sizeof(*nop_loc));
-        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        uint32_t nop_header = (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE)
+                            | (1 << HSA_PACKET_HEADER_BARRIER);
+        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), nop_header, __ATOMIC_RELEASE);
         hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
         return;
@@ -1201,7 +1203,9 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
             &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
         memset(nop_loc, 0, sizeof(*nop_loc));
-        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), 0, __ATOMIC_RELEASE);
+        uint32_t nop_header = (HSA_PACKET_TYPE_BARRIER_AND << HSA_PACKET_HEADER_TYPE)
+                            | (1 << HSA_PACKET_HEADER_BARRIER);
+        __atomic_store_n(reinterpret_cast<uint32_t*>(nop_loc), nop_header, __ATOMIC_RELEASE);
         hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
         return;
