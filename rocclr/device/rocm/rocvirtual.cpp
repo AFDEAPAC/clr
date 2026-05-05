@@ -81,6 +81,15 @@ namespace amd::roc {
 // (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE) invalidates L1, L2 and flushes
 // L2
 
+static int64_t AqlSpinDeadlineMs() {
+  static int64_t cached = -1;
+  if (cached < 0) {
+    const char* v = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
+    cached = (v && std::atol(v) > 0) ? std::atol(v) : 5000;
+  }
+  return cached;
+}
+
 static constexpr uint16_t kInvalidAql =
     (HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE);
 
@@ -896,7 +905,7 @@ bool VirtualGPU::dispatchGenericAqlPacket(
       if (!bail) {
         auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - aql_spin_t0).count();
-        bail = (aql_ms >= 5000);
+        bail = (aql_ms >= AqlSpinDeadlineMs());
       }
       if (bail) {
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
@@ -1095,16 +1104,12 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
       if (!bail) {
         auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - aql_spin_t0).count();
-        bail = (aql_ms >= 5000);
+        bail = (aql_ms >= AqlSpinDeadlineMs());
       }
       if (bail) {
         hsa_barrier_and_packet_t* nop_loc =
             &(reinterpret_cast<hsa_barrier_and_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
-        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
-        // Previously stored 0 = HSA_PACKET_TYPE_VENDOR_SPECIFIC, which has no
-        // handler and triggers HSA_STATUS_ERROR_INVALID_PACKET_FORMAT 0x1009
-        // (e.g. observed in sdma_suballoc reproducer).
         memset(nop_loc, 0, sizeof(*nop_loc));
         __atomic_store_n(
             reinterpret_cast<uint16_t*>(nop_loc),
@@ -1201,15 +1206,12 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
       if (!bail) {
         auto aql_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - aql_spin_t0).count();
-        bail = (aql_ms >= 5000);
+        bail = (aql_ms >= AqlSpinDeadlineMs());
       }
       if (bail) {
         hsa_amd_barrier_value_packet_t* nop_loc =
             &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
-        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
-        // Previously stored 0 = HSA_PACKET_TYPE_VENDOR_SPECIFIC, which has no
-        // handler and triggers HSA_STATUS_ERROR_INVALID_PACKET_FORMAT 0x1009.
         memset(nop_loc, 0, sizeof(*nop_loc));
         __atomic_store_n(
             reinterpret_cast<uint16_t*>(nop_loc),
