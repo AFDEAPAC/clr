@@ -237,13 +237,42 @@ struct DeferredFreeEntry {
   uint64_t enqueue_ns;
 };
 
+static constexpr size_t kMaxDeferredFrees = 256;
 static std::mutex deferred_free_mu_;
 static std::vector<DeferredFreeEntry> deferred_free_queue_;
+static std::atomic<size_t> deferred_drop_count_{0};
 
 static size_t DeferFree(void* ptr, int device_id) {
-  std::lock_guard<std::mutex> lk(deferred_free_mu_);
-  deferred_free_queue_.push_back({ptr, device_id, NowNs()});
-  return deferred_free_queue_.size();
+  std::vector<DeferredFreeEntry> evicted;
+  size_t qsz;
+  {
+    std::lock_guard<std::mutex> lk(deferred_free_mu_);
+    while (deferred_free_queue_.size() >= kMaxDeferredFrees) {
+      evicted.push_back(std::move(deferred_free_queue_.front()));
+      deferred_free_queue_.erase(deferred_free_queue_.begin());
+    }
+    deferred_free_queue_.push_back({ptr, device_id, NowNs()});
+    qsz = deferred_free_queue_.size();
+  }
+  for (auto& e : evicted) {
+    size_t offset = 0;
+    amd::Memory* mem = getMemoryObject(e.ptr, offset);
+    if (mem) {
+      if (mem->isInterop()) {
+        amd::MemObjMap::RemoveMemObj(e.ptr);
+        mem->release();
+      } else {
+        amd::SvmBuffer::free(mem->getContext(), e.ptr);
+      }
+    }
+    size_t drops = deferred_drop_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((drops & (drops - 1)) == 0) {
+      ClPrint(amd::LOG_WARNING, amd::LOG_API,
+              "hipFree: deferred queue cap (%zu) reached, force-freed stale "
+              "entry %p (total force-frees: %zu)", kMaxDeferredFrees, e.ptr, drops);
+    }
+  }
+  return qsz;
 }
 
 static void DrainDeferredFrees() {
