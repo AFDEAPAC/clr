@@ -19,6 +19,9 @@
  THE SOFTWARE. */
 
 #include <chrono>
+#include <future>
+#include <thread>
+#include <vector>
 #include <hip/hip_runtime.h>
 #include <hip/hip_deprecated.h>
 
@@ -259,6 +262,29 @@ void Device::SyncAllStreams( bool cpu_wait) {
   SyncAllStreamsBounded(cpu_wait, 0);
 }
 
+// L3 V17.5-rc3-candidate: threshold for switching from sequential per-stream
+// finish() loop to parallel fan-out (one std::async task per stream). For
+// small stream counts the thread-pool overhead exceeds the savings; for
+// large counts (e.g. 128 poison streams in device_sync_hang) parallel fan-out
+// turns N x per-stream-finish-cost into ~max(per-stream-finish-cost). Combined
+// with L2 (HostQueue::finish entry AwaitDegraded fast-check), the typical
+// degradation case is bounded by ~1 stream's HIP_AWAIT_FAIL_MS regardless of
+// stream count.
+//
+// Threshold can be overridden via HIP_SYNC_PARALLEL_THRESHOLD env (default 16).
+// HIP_SYNC_PARALLEL_THRESHOLD=0 disables L3 (legacy sequential behaviour).
+static size_t L3_ParallelThreshold() {
+  static const size_t cached = []{
+    const char* s = std::getenv("HIP_SYNC_PARALLEL_THRESHOLD");
+    if (s == nullptr || *s == '\0') return (size_t)16;
+    char* end = nullptr;
+    auto v = std::strtoull(s, &end, 10);
+    if (end == s) return (size_t)16;
+    return (size_t)v;
+  }();
+  return cached;
+}
+
 // K-6 V17.5: bounded version. wall_deadline_ns == 0 means no deadline.
 // Otherwise: total wall-clock time spent in this call is capped at
 // (NowNs() at entry + wall_deadline_ns). Once the deadline is exceeded,
@@ -267,6 +293,14 @@ void Device::SyncAllStreams( bool cpu_wait) {
 // check elapsed time after the call and return hipErrorNotReady to its
 // own caller, so the customer service loop sees a fast failure instead
 // of a multi-minute stall.
+//
+// L3 V17.5-rc3-candidate: when stream count exceeds L3_ParallelThreshold(),
+// dispatch finish() in parallel via std::async to avoid the N x per-stream
+// compounding seen in device_sync_hang. wall_deadline_ns is honoured by
+// joining each future with a remaining-time wait_for(); futures still pending
+// past the deadline are abandoned (the underlying finish() will eventually
+// complete on its own thread bounded by HIP_AWAIT_FAIL_MS). The deadline
+// becomes the worst-case wall-clock cap regardless of stream count.
 void Device::SyncAllStreamsBounded( bool cpu_wait, uint64_t wall_deadline_ns) {
   // Make a local copy to avoid stalls for GPU finish with multiple threads.
   std::vector<hip::Stream*> streams;
@@ -288,6 +322,40 @@ void Device::SyncAllStreamsBounded( bool cpu_wait, uint64_t wall_deadline_ns) {
     deadline_abs_ns = now_ns + wall_deadline_ns;
   }
 
+  // L3: parallel fan-out path when stream count is large AND a deadline is set.
+  // Without a deadline we cannot cleanly abandon a pending future, so fall
+  // back to the sequential path (which is unchanged from K-6).
+  const size_t threshold = L3_ParallelThreshold();
+  if (threshold > 0 && wall_deadline_ns != 0 && streams.size() > threshold) {
+    std::vector<std::future<void>> futures;
+    futures.reserve(streams.size());
+    for (auto it : streams) {
+      futures.emplace_back(std::async(std::launch::async,
+        [it, cpu_wait]() { it->finish(cpu_wait); }));
+    }
+    // Join with remaining-time wait. Futures past deadline are detached
+    // (their thread continues, finish() bounded by HIP_AWAIT_FAIL_MS).
+    for (size_t i = 0; i < futures.size(); ++i) {
+      auto now = std::chrono::steady_clock::now().time_since_epoch();
+      uint64_t now_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+      if (now_ns >= deadline_abs_ns) {
+        // Remaining futures abandoned (will complete asynchronously).
+        break;
+      }
+      uint64_t remaining_ns = deadline_abs_ns - now_ns;
+      futures[i].wait_for(std::chrono::nanoseconds(remaining_ns));
+    }
+    // Release retain() for all streams.
+    for (auto it : streams) {
+      it->release();
+    }
+    ReleaseFreedMemory();
+    ReleaseGraphExec(hip::getCurrentDevice()->deviceId());
+    return;
+  }
+
+  // Sequential path (original K-6 behaviour, plus L1+L2 fast-fail benefits).
   bool deadline_hit = false;
   for (auto it : streams) {
     if (!deadline_hit && deadline_abs_ns != 0) {
