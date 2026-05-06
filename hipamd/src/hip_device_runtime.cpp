@@ -621,13 +621,27 @@ namespace {
 // K-6.2 V17.5: opt-in bound for hipDeviceSynchronize. Reads the same
 // HIP_FREE_SYNC_FAIL_MS env that K-6 / K-6.1 read in hip_memory.cpp.
 // Self-contained to avoid cross-TU coupling. ms == 0 keeps pre-V17.5 behaviour.
+//
+// L1 V17.5-rc3-candidate: defensive default. If HIP_FREE_SYNC_FAIL_MS is unset
+// but HIP_SERVICE_SURVIVAL=1, fall back to a sane 8000 ms cap so misconfigured
+// installs (gold ENV partially applied) still get bounded device sync instead
+// of N x 2s compounding (e.g. device_sync_hang reproducer with 128 streams ->
+// 256s without this default). HIP_FREE_SYNC_FAIL_MS=0 still preserves legacy.
 static uint64_t HipDevSyncFailNs() {
   const char* v = std::getenv("HIP_FREE_SYNC_FAIL_MS");
-  if (v == nullptr || *v == '\0') return 0;
-  char* end = nullptr;
-  unsigned long long ms = std::strtoull(v, &end, 10);
-  if (end == v) return 0;
-  return ms == 0 ? 0 : (uint64_t)ms * 1000000ULL;
+  if (v != nullptr && *v != '\0') {
+    char* end = nullptr;
+    unsigned long long ms = std::strtoull(v, &end, 10);
+    if (end != v && ms > 0) return (uint64_t)ms * 1000000ULL;
+    if (end != v && ms == 0) return 0;  // explicit opt-out
+  }
+  // L1: HIP_FREE_SYNC_FAIL_MS unset (or non-numeric). If service-survival is
+  // enabled, default to 8 s rather than unbounded.
+  const char* surv = std::getenv("HIP_SERVICE_SURVIVAL");
+  if (surv != nullptr && surv[0] == '1') {
+    return 8000ULL * 1000000ULL;
+  }
+  return 0;
 }
 }  // anonymous namespace
 
