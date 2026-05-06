@@ -63,9 +63,20 @@ inline uint64_t WaitForSignalBlockedFailMs() {
 template <bool active_wait_timeout = false>
 inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool forced_wait = false) {
   if (hsa_signal_load_relaxed(signal) > 0) {
+    // K-7.9 V17.5 (v2 — review fix): compute the wall-clock deadline ONCE
+    // up front and apply to BOTH the ACTIVE and BLOCKED phases. The previous
+    // version only bound the BLOCKED fallback, which left the ACTIVE branch
+    // (active_wait=true caller, e.g. streams created with implicit active
+    // wait) unbounded — kUnlimitedWait spin until SIGKILL.
+    // HIP_AWAIT_FAIL_MS=0 preserves legacy unbounded behavior.
+    const uint64_t fail_ms = WaitForSignalBlockedFailMs();
+    const uint64_t deadline_ns = (fail_ms == 0)
+        ? kUnlimitedWait
+        : fail_ms * 1000000ULL;
+
     uint64_t timeout = kTimeout100us;
     if (active_wait) {
-      timeout = kUnlimitedWait;
+      timeout = deadline_ns;  // K-7.9 (v2): was kUnlimitedWait
     }
     if (active_wait_timeout) {
       // If forced wait is set, then wait for 10us, else dont wait. (ns * K = us)
@@ -84,19 +95,19 @@ inline bool WaitForSignal(hsa_signal_t signal, bool active_wait = false, bool fo
       if (active_wait_timeout) {
         return false;
       }
+      // K-7.9 (v2): if the caller requested active_wait and we already burned
+      // the full deadline in ACTIVE state, bail without falling through to
+      // another full BLOCKED wait. Prevents 2× deadline budgets.
+      if (active_wait && fail_ms != 0) {
+        ClPrint(amd::LOG_WARNING, amd::LOG_SIG,
+                "K-7.9 WaitForSignal ACTIVE timeout after %llu ms — signal=(0x%lx)",
+                static_cast<unsigned long long>(fail_ms), signal.handle);
+        return false;
+      }
       ClPrint(amd::LOG_INFO, amd::LOG_SIG, "Host blocked wait for Signal = (0x%lx)",
               signal.handle);
 
-      // K-7.9 V17.5: bound the BLOCKED fallback wait by HIP_AWAIT_FAIL_MS
-      // (default 4000 ms). Previously this was kUnlimitedWait, which under
-      // cgroup memory pressure / RDMA pin saturation caused permanent hang
-      // (customer scenario: hipMemcpy H2D pageable -> kb->copyBuffer ->
-      // CpuWaitForSignal -> WaitForSignal -> infinite block).
-      // HIP_AWAIT_FAIL_MS=0 preserves legacy unbounded behavior.
-      const uint64_t fail_ms = WaitForSignalBlockedFailMs();
-      const uint64_t deadline_ns = (fail_ms == 0)
-          ? kUnlimitedWait
-          : fail_ms * 1000000ULL;
+      // BLOCKED fallback also bounded by the same deadline.
       if (hsa_signal_wait_scacquire(signal, HSA_SIGNAL_CONDITION_LT, kInitSignalValueOne,
                                     deadline_ns, HSA_WAIT_STATE_BLOCKED) != 0) {
         if (fail_ms != 0) {
