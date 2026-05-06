@@ -133,6 +133,27 @@ bool HostQueue::terminate() {
 }
 
 void HostQueue::finish(bool cpu_wait) {
+  // L2 V17.5-rc3-candidate: if the per-device AwaitDegraded latch is already
+  // set (by an earlier finish() in this SyncAllStreams loop, or by any other
+  // K-7.x path), skip the IsHwEventReady (~HIP_AWAIT_FAIL_MS) wait below.
+  // Cures the N x HIP_AWAIT_FAIL_MS compounding seen in device_sync_hang
+  // (128 streams x 2 s = 256 s without this check) by short-circuiting every
+  // stream after the first that triggered the latch.
+  if (vdev() != nullptr && vdev()->device().AwaitDegraded()) {
+    Command* cmd_ld = getLastQueuedCommand(true);
+    if (cmd_ld != nullptr) {
+      cmd_ld->setStatus(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+      ScopedLock sl(vdev()->execution());
+      ScopedLock l(lastCmdLock_);
+      if (cmd_ld == lastEnqueueCommand_) {
+        lastEnqueueCommand_->release();
+        lastEnqueueCommand_ = nullptr;
+      }
+      cmd_ld->release();
+    }
+    return;
+  }
+
   Command* command = nullptr;
   if (IS_HIP) {
     command = getLastQueuedCommand(true);
