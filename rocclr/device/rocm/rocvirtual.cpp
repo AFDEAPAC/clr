@@ -1385,13 +1385,17 @@ VirtualGPU::~VirtualGPU() {
   delete blitMgr_;
 
   if (tracking_created_) {
-    // Release the resources of signal
     releaseGpuMemoryFence();
   }
 
   destroyPool();
 
-  releasePinnedMem();
+  // K-7.10: skip releasePinnedMem if degraded — each pinned mem release
+  // can trigger SyncAllStreamsBounded (2s each), N pinned mems = N×2s.
+  // Process exit will reclaim all GPU resources via KFD cleanup.
+  if (!device().AwaitDegraded()) {
+    releasePinnedMem();
+  }
 
   if (timestamp_ != nullptr) {
     timestamp_->release();

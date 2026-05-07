@@ -113,8 +113,18 @@ RuntimeTearDown::~RuntimeTearDown() {
   // Only perform destruction if process matches the initialization,
   // to avoid a call with the child process after fork()
   if (amd::IS_HIP && amd::Os::getProcessId() == Runtime::pid()) {
-    for (auto it: external_) {
-      it->release();
+    // FIX-CQ2: skip GPU-interacting teardown when service-survival is on.
+    // In degraded state each release() can trigger SyncAllStreams which waits
+    // per-stream timeout, accumulating to minutes. KFD process cleanup will
+    // reclaim all resources on exit. Checking ROCR_SERVICE_SURVIVAL env is
+    // safe here — if survival was never enabled there is no degraded state.
+    const char* surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+    const char* hsurv = std::getenv("HIP_SERVICE_SURVIVAL");
+    bool survival_on = (surv && surv[0] == '1') || (hsurv && hsurv[0] == '1');
+    if (!survival_on) {
+      for (auto it: external_) {
+        it->release();
+      }
     }
     Runtime::tearDown();
   }

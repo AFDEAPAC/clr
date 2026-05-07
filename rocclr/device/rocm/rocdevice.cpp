@@ -246,62 +246,75 @@ void Device::checkAtomicSupport() {
 }
 
 Device::~Device() {
+  // FIX-CQ2: if device is degraded, skip GPU-interacting cleanup.
+  // svmFree, hsa_queue_destroy, context release, xferQueue delete all
+  // trigger SyncAllStreams / GPU waits that accumulate to minutes.
+  // Process exit via KFD reclaims everything.
+  const bool skip_gpu_cleanup = AwaitDegraded();
+
   if (coopHostcallBuffer_) {
     amd::disableHostcalls(coopHostcallBuffer_);
-    context().svmFree(coopHostcallBuffer_);
+    if (!skip_gpu_cleanup) {
+      context().svmFree(coopHostcallBuffer_);
+    }
     coopHostcallBuffer_ = nullptr;
   }
   // Release cached map targets
-  for (uint i = 0; mapCache_ != nullptr && i < mapCache_->size(); ++i) {
-    if ((*mapCache_)[i] != nullptr) {
-      (*mapCache_)[i]->release();
+  if (!skip_gpu_cleanup) {
+    for (uint i = 0; mapCache_ != nullptr && i < mapCache_->size(); ++i) {
+      if ((*mapCache_)[i] != nullptr) {
+        (*mapCache_)[i]->release();
+      }
     }
   }
   delete mapCache_;
   delete mapCacheOps_;
 
   if (nullptr != p2p_stage_) {
-    p2p_stage_->release();
+    if (!skip_gpu_cleanup) {
+      p2p_stage_->release();
+    }
     p2p_stage_ = nullptr;
   }
   if (nullptr != mg_sync_) {
-    GlbCtx().svmFree(mg_sync_);
+    if (!skip_gpu_cleanup) {
+      GlbCtx().svmFree(mg_sync_);
+    }
     mg_sync_ = nullptr;
   }
   if (glb_ctx_ != nullptr) {
-      glb_ctx_->release();
+      if (!skip_gpu_cleanup) glb_ctx_->release();
       glb_ctx_ = nullptr;
   }
 
-  for (auto& it : queuePool_) {
-    for (auto qIter = it.begin(); qIter != it.end(); ) {
-      hsa_queue_t* queue = qIter->first;
-      auto& qInfo = qIter->second;
-      if (qInfo.hostcallBuffer_) {
-        ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "Deleting hostcall buffer %p for hardware queue %p",
-                qInfo.hostcallBuffer_, qIter->first->base_address);
-        amd::disableHostcalls(qInfo.hostcallBuffer_);
-        context().svmFree(qInfo.hostcallBuffer_);
+  if (!skip_gpu_cleanup) {
+    for (auto& it : queuePool_) {
+      for (auto qIter = it.begin(); qIter != it.end(); ) {
+        hsa_queue_t* queue = qIter->first;
+        auto& qInfo = qIter->second;
+        if (qInfo.hostcallBuffer_) {
+          amd::disableHostcalls(qInfo.hostcallBuffer_);
+          context().svmFree(qInfo.hostcallBuffer_);
+        }
+        qIter = it.erase(qIter);
+        hsa_queue_destroy(queue);
       }
-      ClPrint(amd::LOG_INFO, amd::LOG_QUEUE, "Deleting hardware queue %p with refCount 0",
-              queue->base_address);
-      qIter = it.erase(qIter);
-      hsa_queue_destroy(queue);
     }
   }
   queuePool_.clear();
 
-  // Destroy temporary buffers for read/write
-  delete xferRead_;
-  delete xferWrite_;
+  if (!skip_gpu_cleanup) {
+    delete xferRead_;
+    delete xferWrite_;
+    delete xferQueue_;
+  }
 
-  // Destroy transfer queue
-  delete xferQueue_;
-
-  delete blitProgram_;
+  if (!skip_gpu_cleanup) {
+    delete blitProgram_;
+  }
 
   if (context_ != nullptr) {
-    context_->release();
+    if (!skip_gpu_cleanup) context_->release();
   }
 
   delete[] p2p_agents_list_;
