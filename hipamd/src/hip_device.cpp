@@ -330,26 +330,27 @@ void Device::SyncAllStreamsBounded( bool cpu_wait, uint64_t wall_deadline_ns) {
     std::vector<std::future<void>> futures;
     futures.reserve(streams.size());
     for (auto it : streams) {
+      // Each async task owns its retain() ref and releases it when done,
+      // preventing use-after-free if the main thread breaks out early.
       futures.emplace_back(std::async(std::launch::async,
-        [it, cpu_wait]() { it->finish(cpu_wait); }));
+        [it, cpu_wait]() { it->finish(cpu_wait); it->release(); }));
     }
-    // Join with remaining-time wait. Futures past deadline are detached
-    // (their thread continues, finish() bounded by HIP_AWAIT_FAIL_MS).
+    // Join with remaining-time wait. Futures past deadline keep running
+    // asynchronously (finish() bounded by HIP_AWAIT_FAIL_MS); their
+    // release() will fire when the async thread completes.
     for (size_t i = 0; i < futures.size(); ++i) {
       auto now = std::chrono::steady_clock::now().time_since_epoch();
       uint64_t now_ns =
           std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
       if (now_ns >= deadline_abs_ns) {
-        // Remaining futures abandoned (will complete asynchronously).
         break;
       }
       uint64_t remaining_ns = deadline_abs_ns - now_ns;
       futures[i].wait_for(std::chrono::nanoseconds(remaining_ns));
     }
-    // Release retain() for all streams.
-    for (auto it : streams) {
-      it->release();
-    }
+    // Note: stream release is now inside each async lambda — no separate
+    // release loop needed. Streams whose futures are still running will
+    // be released when their finish() completes.
     ReleaseFreedMemory();
     ReleaseGraphExec(hip::getCurrentDevice()->deviceId());
     return;

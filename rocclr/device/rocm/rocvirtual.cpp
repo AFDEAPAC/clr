@@ -81,15 +81,18 @@ namespace amd::roc {
 // (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE) invalidates L1, L2 and flushes
 // L2
 
-// AQL spin-loop deadline: uses ROCR_SIGNAL_WAIT_MAX_MS if set, else 5000ms.
-// This shares the ENV with WaitForSignal to keep config simple, though the
-// semantics differ slightly (AQL write-slot spin vs HSA signal wait).
+// AQL spin-loop deadline: reads HIP_AWAIT_FAIL_MS first (preferred CLR-layer
+// knob), falls back to ROCR_SIGNAL_WAIT_MAX_MS (ROCr-layer / back-compat),
+// then 5000ms default. Matches ComputeAwaitTimeoutMs() fallback chain.
 static int64_t AqlSpinDeadlineMs() {
   static const int64_t cached = []{
-    const char* v = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
-    if (v && *v) {
-      long val = std::atol(v);
-      if (val > 0) return static_cast<int64_t>(val);
+    for (const char* name : {"HIP_AWAIT_FAIL_MS", "ROCR_SIGNAL_WAIT_MAX_MS"}) {
+      const char* v = std::getenv(name);
+      if (v && *v) {
+        char* end = nullptr;
+        long val = std::strtol(v, &end, 10);
+        if (end != v && val > 0) return static_cast<int64_t>(val);
+      }
     }
     return int64_t{5000};
   }();
@@ -922,7 +925,18 @@ bool VirtualGPU::dispatchGenericAqlPacket(
       }
       if (bail) {
         const_cast<amd::Device&>(static_cast<const amd::Device&>(dev())).SetAwaitDegraded();
-        break;
+        // Write INVALID packet to the slot (same as barrier bailout paths)
+        // so HSA skips this slot. Without this, the code falls through and
+        // writes the real packet to a potentially non-free slot → queue
+        // corruption under backpressure.
+        AqlPacket* nop_loc = &((AqlPacket*)(gpu_queue_->base_address))[index & queueMask];
+        memset(nop_loc, 0, sizeof(*nop_loc));
+        __atomic_store_n(
+            reinterpret_cast<uint16_t*>(nop_loc),
+            static_cast<uint16_t>(HSA_PACKET_TYPE_INVALID << HSA_PACKET_HEADER_TYPE),
+            __ATOMIC_RELEASE);
+        hsa_signal_store_screlease(gpu_queue_->doorbell_signal, index);
+        return false;
       }
     }
   }

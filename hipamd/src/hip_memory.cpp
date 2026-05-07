@@ -228,7 +228,11 @@ static bool FreeRejectOnActive() {
 
 static uint64_t FreeSyncFailNs() {
   const uint64_t ms = EnvU64("HIP_FREE_SYNC_FAIL_MS", 0);
-  return ms == 0 ? 0 : ms * 1000000ULL;
+  if (ms > 0) return ms * 1000000ULL;
+  if (ms == 0 && EnvEnabled("HIP_SERVICE_SURVIVAL")) {
+    return 8000ULL * 1000000ULL;
+  }
+  return 0;
 }
 
 struct DeferredFreeEntry {
