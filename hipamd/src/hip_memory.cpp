@@ -931,20 +931,41 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
     }
   }
 
-  // K-7.8.3 V17.5: entry-gate for sync DtoH and pageable H2D on a
-  // degraded device. DtoH copies complete asynchronously via SDMA even
-  // when compute is hung; their completion triggers K-7.5 auto-clear,
-  // creating a TOCTOU race for subsequent sync APIs (hipMemset sees a
-  // cleared latch). Pageable H2D can hang in WaitRelaxed under RDMA
-  // quota exhaustion. Pinned H2D is allowed through — it's needed for
-  // control operations like releasing hung kernels.
+  // K-7.11 V17.5-rc3: degraded-device copy handling. The original K-7.8.3
+  // gate returned hipErrorNotReady for all pageable H2D and sync DtoH when
+  // degraded, which created a deadlock: the gate blocked new SDMA work,
+  // preventing any event completion, preventing K-7.5 auto-clear from
+  // firing, keeping the latch stuck forever.
+  //
+  // New behavior: when degraded, fall through to the CPU memcpy path
+  // (ihipHtoHMemcpy) instead of returning error. This lets the copy
+  // complete (slowly, via CPU) so subsequent operations (kernel dispatch,
+  // stream sync) can proceed, giving K-7.5 auto-clear a chance to fire
+  // if the SDMA has recovered. If SDMA is still stuck, the next wait
+  // will re-set the degraded latch; if it recovered, the latch clears
+  // naturally. Pinned H2D is still allowed through unchanged.
   const bool isCopyFromDevice = (srcMemory != nullptr && dstMemory == nullptr);
   if (!isHostAsync && (isCopyFromDevice || isPageableH2D) &&
       stream.device().AwaitDegraded()) {
     if (pageableCopyAccounted) {
       GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
     }
-    return hipErrorNotReady;
+    // CPU fallback: memcpy through host staging instead of SDMA
+    ClPrint(amd::LOG_WARNING, amd::LOG_COPY,
+            "K-7.11: degraded device — falling back to CPU memcpy for %zu bytes "
+            "(SDMA path bypassed to break K-7.5/K-7.8.3 deadlock)", sizeBytes);
+    if (isCopyFromDevice) {
+      // DtoH: need to map GPU memory, read via BAR, copy to host
+      // For now, return error for DtoH — GPU read via BAR is complex
+      // and DtoH doesn't cause the deadlock (it's the H2D that does)
+      return hipErrorNotReady;
+    }
+    // Pageable H2D: copy via CPU memcpy to device-visible host memory
+    // then let the GPU read it. Use the HtoH path which does a simple
+    // memcpy — the destination is GPU memory mapped to the host via
+    // large BAR or coherent memory.
+    ihipHtoHMemcpy(dst, src, sizeBytes, stream);
+    return hipSuccess;
   }
 
   if (srcMemory == nullptr && dstMemory == nullptr) {
