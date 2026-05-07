@@ -22,6 +22,7 @@
 #include "thread/monitor.hpp"
 #include "device/device.hpp"
 #include "platform/context.hpp"
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -102,9 +103,39 @@ bool HostQueue::terminate() {
           }
         }
       }
+      // FIX-CQ1 V17.5-rc3: bound the non-direct-dispatch terminate() yield
+      // loops. The original code had two unbounded yield loops:
+      //   (1) wait for marker completion (marker->status() > CL_COMPLETE)
+      //   (2) wait for thread finish (thread_.state() < Thread::FINISHED)
+      // If a GPU fence is stuck, (1) spins forever. (2) has the same risk
+      // after the FIXME_lmoriche comment. Both are now bounded by the same
+      // service-survival deadline used by K-7.2 awaitCompletion.
+      // On Linux AMD_DIRECT_DISPATCH=true by default so this path is not
+      // normally taken, but defensive bounding prevents hang if someone
+      // sets AMD_DIRECT_DISPATCH=0 or on non-Linux platforms.
+      auto terminate_deadline = []{
+        const char* hip_surv = std::getenv("HIP_SERVICE_SURVIVAL");
+        const char* rocr_surv = std::getenv("ROCR_SERVICE_SURVIVAL");
+        bool gated = (hip_surv && hip_surv[0] == '1') ||
+                     (rocr_surv && rocr_surv[0] == '1');
+        if (!gated) return std::chrono::steady_clock::time_point::max();
+        uint64_t ms = 0;
+        for (const char* name : {"HIP_AWAIT_FAIL_MS", "ROCR_SIGNAL_WAIT_MAX_MS"}) {
+          const char* v = std::getenv(name);
+          if (v && *v) { char* e; ms = std::strtoull(v, &e, 10); if (e != v && ms > 0) break; ms = 0; }
+        }
+        if (ms == 0) ms = 10000;
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+      }();
+
       if (marker != nullptr) {
         if (marker->notifyCmdQueue()) {
           while (marker->status() > CL_COMPLETE && Os::isThreadAlive(thread_)) {
+            if (std::chrono::steady_clock::now() > terminate_deadline) {
+              ClPrint(LOG_WARNING, LOG_CMD,
+                      "FIX-CQ1: terminate() marker wait timed out — breaking");
+              break;
+            }
             amd::Os::yield();
           }
         }
@@ -120,6 +151,11 @@ bool HostQueue::terminate() {
 
       // FIXME_lmoriche: fix termination handshake
       while (thread_.state() < Thread::FINISHED && Os::isThreadAlive(thread_)) {
+        if (std::chrono::steady_clock::now() > terminate_deadline) {
+          ClPrint(LOG_WARNING, LOG_CMD,
+                  "FIX-CQ1: terminate() thread-finish wait timed out — breaking");
+          break;
+        }
         Os::yield();
       }
     }
