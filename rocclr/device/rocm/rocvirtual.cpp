@@ -81,12 +81,18 @@ namespace amd::roc {
 // (HSA_FENCE_SCOPE_SYSTEM << HSA_PACKET_HEADER_RELEASE_FENCE_SCOPE) invalidates L1, L2 and flushes
 // L2
 
+// AQL spin-loop deadline: uses ROCR_SIGNAL_WAIT_MAX_MS if set, else 5000ms.
+// This shares the ENV with WaitForSignal to keep config simple, though the
+// semantics differ slightly (AQL write-slot spin vs HSA signal wait).
 static int64_t AqlSpinDeadlineMs() {
-  static int64_t cached = -1;
-  if (cached < 0) {
+  static const int64_t cached = []{
     const char* v = std::getenv("ROCR_SIGNAL_WAIT_MAX_MS");
-    cached = (v && std::atol(v) > 0) ? std::atol(v) : 5000;
-  }
+    if (v && *v) {
+      long val = std::atol(v);
+      if (val > 0) return static_cast<int64_t>(val);
+    }
+    return int64_t{5000};
+  }();
   return cached;
 }
 
@@ -1114,6 +1120,9 @@ void VirtualGPU::dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal,
         bail = (aql_ms >= AqlSpinDeadlineMs());
       }
       if (bail) {
+        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
+        // Using 0x0000 would be HSA_PACKET_TYPE_VENDOR_SPECIFIC which has
+        // no handler registered → HSA_STATUS_ERROR_INVALID_PACKET_FORMAT.
         hsa_barrier_and_packet_t* nop_loc =
             &(reinterpret_cast<hsa_barrier_and_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
@@ -1216,6 +1225,9 @@ void VirtualGPU::dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveD
         bail = (aql_ms >= AqlSpinDeadlineMs());
       }
       if (bail) {
+        // Fix: write HSA_PACKET_TYPE_INVALID (= 1) so HSA skips this slot.
+        // Using 0x0000 would be HSA_PACKET_TYPE_VENDOR_SPECIFIC which has
+        // no handler registered → HSA_STATUS_ERROR_INVALID_PACKET_FORMAT.
         hsa_amd_barrier_value_packet_t* nop_loc =
             &(reinterpret_cast<hsa_amd_barrier_value_packet_t*>(
                 gpu_queue_->base_address))[index & queueMask];
