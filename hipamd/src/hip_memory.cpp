@@ -76,40 +76,47 @@ static uint64_t NowNs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// V17.5-rc4 Group A: cgroup memory helpers
-static uint64_t ReadCgroupFile(const char* filename) {
-  FILE* cg = fopen("/proc/self/cgroup", "r");
-  if (!cg) return UINT64_MAX;
-  char line[512], cg_path[256] = "";
-  while (fgets(line, sizeof(line), cg)) {
-    if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
-      char* p = line + 3; p[strcspn(p, "\n")] = 0;
-      snprintf(cg_path, sizeof(cg_path), "%s", p); break;
+// V17.5-rc4 Group A: cgroup memory helpers (supports v1 + v2, inside container)
+// Inside a container, the process sees itself as root of its cgroup namespace.
+// So the files are at /sys/fs/cgroup/memory/ (v1) or /sys/fs/cgroup/ (v2).
+static uint64_t ReadCgroupMemVal(const char* filename) {
+  // Try paths in order of likelihood:
+  const char* paths[] = {
+    // v1 inside container (most common for Docker on RHEL/CentOS)
+    "/sys/fs/cgroup/memory/%s",
+    // v2 inside container
+    "/sys/fs/cgroup/%s",
+    nullptr
+  };
+  char path[256];
+  for (int i = 0; paths[i]; i++) {
+    snprintf(path, sizeof(path), paths[i], filename);
+    FILE* f = fopen(path, "r");
+    if (f) {
+      char buf[64];
+      if (fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        if (strncmp(buf, "max", 3) == 0) return UINT64_MAX;
+        char* end = nullptr;
+        uint64_t val = strtoull(buf, &end, 10);
+        if (end != buf) return val;
+      } else {
+        fclose(f);
+      }
     }
   }
-  fclose(cg);
-  if (cg_path[0] == 0) return UINT64_MAX;
-  char path[512];
-  snprintf(path, sizeof(path), "/sys/fs/cgroup%s/%s", cg_path, filename);
-  FILE* f = fopen(path, "r");
-  if (!f) {
-    snprintf(path, sizeof(path), "/sys/fs/cgroup/memory%s/%s", cg_path,
-             strcmp(filename, "memory.max") == 0 ? "memory.limit_in_bytes" :
-             strcmp(filename, "memory.current") == 0 ? "memory.usage_in_bytes" :
-             filename);
-    f = fopen(path, "r");
-    if (!f) return UINT64_MAX;
-  }
-  char buf[64];
-  if (!fgets(buf, sizeof(buf), f)) { fclose(f); return UINT64_MAX; }
-  fclose(f);
-  if (strncmp(buf, "max", 3) == 0) return UINT64_MAX;
-  char* end = nullptr;
-  uint64_t val = strtoull(buf, &end, 10);
-  return (end == buf) ? UINT64_MAX : val;
+  return UINT64_MAX;
 }
-static uint64_t ReadCgroupMemLimit()   { return ReadCgroupFile("memory.max"); }
-static uint64_t ReadCgroupMemCurrent() { return ReadCgroupFile("memory.current"); }
+static uint64_t ReadCgroupMemLimit() {
+  uint64_t v = ReadCgroupMemVal("memory.max");             // v2
+  if (v == UINT64_MAX) v = ReadCgroupMemVal("memory.limit_in_bytes"); // v1
+  return v;
+}
+static uint64_t ReadCgroupMemCurrent() {
+  uint64_t v = ReadCgroupMemVal("memory.current");          // v2
+  if (v == UINT64_MAX) v = ReadCgroupMemVal("memory.usage_in_bytes"); // v1
+  return v;
+}
 static uint64_t CgroupReservePct() {
   static const uint64_t v = EnvU64("HIP_HOST_GUARD_CGROUP_RESERVE_PCT", 25);
   return v;
@@ -139,6 +146,7 @@ static ServiceGuardConfig HostGuard() {
   // mode is on and no explicit HIP_HOST_GUARD_MAX_MB is set.
   if (cfg.enabled && cfg.max_bytes == 0) {
     uint64_t cg_limit = ReadCgroupMemLimit();
+            (unsigned long long)cg_limit, (int)cfg.enabled, (unsigned long long)cfg.max_bytes);
     if (cg_limit != UINT64_MAX && cg_limit > 0) {
       uint64_t reserve_pct = CgroupReservePct();
       uint64_t reserve = cg_limit * reserve_pct / 100;
