@@ -680,5 +680,10 @@ public:
   extern amd::Monitor g_captureStreamsLock;
   extern amd::Monitor g_streamSetLock;
   extern std::unordered_set<hip::Stream*> g_allCapturingStreams;
+
+  // V17.5-rc4 Group B (GPU 100% relax): bounce gate exposed for use in
+  // hip_module.cpp etc. so kernel launches can drop new GPU work during the
+  // post-degraded quiesce window. Defined in hip_memory.cpp.
+  extern bool ShouldBounceForDegraded(amd::Device* dev);
 } // namespace hip
 #endif  // HIP_SRC_HIP_INTERNAL_H

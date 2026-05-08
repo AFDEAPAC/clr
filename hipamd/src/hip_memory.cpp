@@ -246,6 +246,37 @@ static std::mutex deferred_free_mu_;
 static std::vector<DeferredFreeEntry> deferred_free_queue_;
 static std::atomic<size_t> deferred_drop_count_{0};
 
+// V17.5-rc4 Group B (GPU 100% relax): per-process counter for the number of
+// times a submit was bounce-rejected because the device was inside the
+// HIP_DEGRADED_QUIESCE_MS window. Surfaced via SurvivalLogger / ClPrint so
+// operators can see whether the bounce gate is engaging on the customer site.
+static std::atomic<uint64_t> g_degraded_bounce_count{0};
+
+// V17.5-rc4 Group B: cooldown deadline (steady_clock ns) for recovery probes
+// after the bounce window expires. At most one submit is allowed through
+// per HIP_DEGRADED_PROBE_COOLDOWN_MS (default 100). CAS-protected so 32
+// concurrent threads racing to submit yield exactly one probe.
+static std::atomic<uint64_t> g_next_probe_ns{0};
+
+// V17.5-rc4 Group B: how long after SetAwaitDegraded() do we hard-bounce
+// every new GPU-side submit? Default 1000 ms. After this window expires
+// we throttle recovery probes via g_next_probe_ns. Set to 0 to disable
+// (preserves legacy "always bounce while latched" behavior).
+static uint64_t DegradedQuiesceMs() {
+  static const uint64_t v = EnvU64("HIP_DEGRADED_QUIESCE_MS", 1000);
+  return v;
+}
+
+// V17.5-rc4 Group B: cooldown between consecutive recovery probes once the
+// bounce window expires. Default 100 ms. Customer service flow can resume
+// at most ~10 RPS during recovery probing, which is enough to detect GPU
+// recovery via K-7.5 ClearAwaitDegraded() yet slow enough that retry
+// storms can't pin the device back at 100% util.
+static uint64_t DegradedProbeCooldownMs() {
+  static const uint64_t v = EnvU64("HIP_DEGRADED_PROBE_COOLDOWN_MS", 100);
+  return v;
+}
+
 static size_t DeferFree(void* ptr, int device_id) {
   std::vector<DeferredFreeEntry> evicted;
   size_t qsz;
@@ -311,6 +342,64 @@ static void DrainDeferredFrees() {
 
 amd::Monitor hipArraySetLock{"Guards global hipArray set"};
 std::unordered_set<hipArray*> hipArraySet;
+
+// V17.5-rc4 Group B (GPU 100% relax): returns true when a new GPU submit
+// should be bounce-rejected with hipErrorNotReady. External linkage so
+// hip_module.cpp's kernel-launch entry can also bounce. Logic:
+//   1. SERVICE_SURVIVAL must be enabled (else no behavior change at all).
+//   2. The device must currently hold the AwaitDegraded latch.
+//   3. If HIP_DEGRADED_QUIESCE_MS == 0, preserve legacy behavior (always
+//      bounce while latched).
+//   4. Inside [degraded_epoch_ns, degraded_epoch_ns + quiesce_ms): hard
+//      bounce 100% — the window during which previously-submitted waves
+//      drain on the GPU and rocm-smi util falls.
+//   5. After the window: rate-limit recovery probes to one every
+//      HIP_DEGRADED_PROBE_COOLDOWN_MS (default 100 ms). The first thread
+//      to win the CAS on g_next_probe_ns is allowed through; everyone
+//      else continues to bounce. If the probe completes successfully,
+//      K-7.5 ClearAwaitDegraded() fires and bouncing stops; if it fails,
+//      SetAwaitDegraded() is re-armed with a fresh epoch_ns, restarting
+//      the quiesce window.
+// Side effect: increments g_degraded_bounce_count whenever bouncing.
+bool ShouldBounceForDegraded(amd::Device* dev) {
+  if (dev == nullptr || !dev->AwaitDegraded()) return false;
+  // When SERVICE_SURVIVAL is off, preserve the original K-7.x behavior of
+  // always bouncing while the latch is on (no quiesce window, no recovery
+  // probe). The latch is only set from inside survival-mode code paths
+  // anyway, so this branch is mostly defensive.
+  if (!EnvEnabled("HIP_SERVICE_SURVIVAL")) {
+    g_degraded_bounce_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  const uint64_t quiesce_ns = DegradedQuiesceMs() * 1000000ULL;
+  if (quiesce_ns == 0) {
+    g_degraded_bounce_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  const uint64_t now_ns = NowNs();
+  const uint64_t epoch_ns = dev->AwaitDegradedEpochNs();
+  bool bounce;
+  if (epoch_ns != 0 && now_ns - epoch_ns < quiesce_ns) {
+    bounce = true;
+  } else {
+    // Past the quiesce window: rate-limited recovery probes.
+    uint64_t next = g_next_probe_ns.load(std::memory_order_relaxed);
+    if (now_ns >= next) {
+      const uint64_t cooldown_ns = DegradedProbeCooldownMs() * 1000000ULL;
+      const bool won = g_next_probe_ns.compare_exchange_strong(
+          next, now_ns + cooldown_ns, std::memory_order_relaxed);
+      bounce = !won;
+    } else {
+      bounce = true;
+    }
+  }
+  if (bounce) {
+    g_degraded_bounce_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  return bounce;
+}
 
 // ================================================================================================
 amd::Memory* getMemoryObject(const void* ptr, size_t& offset, size_t size) {
@@ -3725,7 +3814,14 @@ hipError_t ihipMemset(void* dst, int64_t value, size_t valueSize, size_t sizeByt
     // isAsync=true for device destinations, but the public API (hipMemset)
     // is sync. Check BEFORE enqueue to avoid a TOCTOU race where a fast
     // SDMA fill triggers K-7.5 auto-clear before we can observe the latch.
-    if (hip_stream != nullptr && hip_stream->device().AwaitDegraded()) {
+    //
+    // V17.5-rc4 Group B (GPU 100% relax): replace the always-bounce check
+    // with the time-windowed gate so that 1 s after SetAwaitDegraded fires
+    // we start sampling 1/8 of submits as recovery probes instead of
+    // bouncing forever (which would prevent K-7.5 auto-clear from ever
+    // observing a fresh successful op).
+    if (hip_stream != nullptr &&
+        ShouldBounceForDegraded(hip_stream->device().devices()[0])) {
       hip_error = hipErrorNotReady;
       break;
     }
@@ -3910,7 +4006,9 @@ hipError_t ihipMemset3D(hipPitchedPtr pitchedDevPtr, int value, hipExtent extent
   hip::Stream* hip_stream = hip::getStream(stream);
 
   // K-7.8.2 V17.5: entry-gate (same as ihipMemset).
-  if (hip_stream != nullptr && hip_stream->device().AwaitDegraded()) {
+  // V17.5-rc4 Group B: same time-windowed bounce gate as the 1D path.
+  if (hip_stream != nullptr &&
+      ShouldBounceForDegraded(hip_stream->device().devices()[0])) {
     return hipErrorNotReady;
   }
 

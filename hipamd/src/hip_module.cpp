@@ -385,6 +385,18 @@ hipError_t ihipModuleLaunchKernel(hipFunction_t f, uint32_t globalWorkSizeX,
   if (globalWorkSizeZ < blockDimZ) blockDimZ = globalWorkSizeZ;
 
   auto device = g_devices[deviceId]->devices()[0];
+  // V17.5-rc4 Group B (GPU 100% relax): if the device is in a degraded
+  // episode, drop new kernel submits during the bounce window so that
+  // already-queued waves can retire and rocm-smi GPU util can fall to
+  // ~0%. Without this gate, application-level retry loops (e.g. PyTorch
+  // serving's request handler) keep stuffing fresh kernels into the AQL
+  // queue while the device is broken, masking the failure as 100% util.
+  // After the bounce window expires, ShouldBounceForDegraded samples
+  // 1/8 of submits as recovery probes — those that complete trigger
+  // K-7.5 ClearAwaitDegraded() and the device is allowed back in service.
+  if (ShouldBounceForDegraded(device)) {
+    return hipErrorNotReady;
+  }
   // Check if it's a uniform kernel and validate dimensions
   if (kernel->getDeviceKernel(*device)->getUniformWorkGroupSize()) {
     if (((globalWorkSizeX % blockDimX) != 0) ||

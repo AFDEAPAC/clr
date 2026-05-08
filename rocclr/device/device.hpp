@@ -47,6 +47,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -2102,9 +2103,24 @@ class Device : public RuntimeObject {
   void SetAwaitDegraded() {
     await_degraded_.store(true, std::memory_order_relaxed);
     await_degraded_epoch_.fetch_add(1, std::memory_order_relaxed);
+    // V17.5-rc4 Group B: stamp the moment the latch fires. Used by
+    // ShouldBounceForDegraded() in hipamd to compute "how long ago did we
+    // degrade" → drives the HIP_DEGRADED_QUIESCE_MS bounce window so that
+    // new GPU submits pause long enough for existing waves to retire and
+    // rocm-smi util to drop. Stored as steady_clock nanoseconds.
+    await_degraded_epoch_ns_.store(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_relaxed);
   }
   uint64_t AwaitDegradedEpoch() const {
     return await_degraded_epoch_.load(std::memory_order_relaxed);
+  }
+  // V17.5-rc4 Group B: returns the steady_clock ns timestamp at which the
+  // most recent SetAwaitDegraded() fired, or 0 if never. Compared against
+  // a fresh steady_clock::now() reading by hipamd's bounce gate.
+  uint64_t AwaitDegradedEpochNs() const {
+    return await_degraded_epoch_ns_.load(std::memory_order_relaxed);
   }
   void ClearAwaitDegraded() {
     await_degraded_.store(false, std::memory_order_relaxed);
@@ -2180,6 +2196,13 @@ class Device : public RuntimeObject {
   // first AwaitWarningTryFire flips it to false (CAS). ClearAwaitDegraded
   // re-arms it so the next degraded episode also emits one warning.
   mutable std::atomic<bool> await_warning_armed_{true};
+  // V17.5-rc4 Group B (GPU 100% relax): steady_clock ns timestamp of the
+  // most recent SetAwaitDegraded(). Read by hipamd's ShouldBounceForDegraded
+  // to gate new GPU submits within HIP_DEGRADED_QUIESCE_MS of the latch
+  // firing, allowing previously-submitted waves to retire and the GPU
+  // utilization indicator to fall to ~0% during a degraded episode. 0
+  // means "never degraded since process start".
+  mutable std::atomic<uint64_t> await_degraded_epoch_ns_{0};
  private:
   const Isa *isa_;                //!< Device isa
   bool IsTypeMatching(cl_device_type type, bool offlineDevices);
