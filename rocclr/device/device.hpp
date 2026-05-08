@@ -2128,6 +2128,22 @@ class Device : public RuntimeObject {
     // permissive-hipFree warning so the next degraded episode emits
     // exactly one log line (rather than spamming a tight cleanup loop).
     await_warning_armed_.store(true, std::memory_order_relaxed);
+    // V17.5-rc4 Group B: reset the per-device probe-cooldown deadline so
+    // the next degraded episode (if any) starts fresh and the very first
+    // post-quiesce probe is allowed through immediately.
+    await_degraded_next_probe_ns_.store(0, std::memory_order_relaxed);
+  }
+  // V17.5-rc4 Group B: per-device CAS gate that rate-limits recovery
+  // probes after the bounce window expires. Returns true if the caller
+  // wins this probe slot (and should be allowed to submit), false if
+  // the cooldown is still in effect or another thread won the race.
+  // Keeping this state per-device prevents a degraded device from
+  // starving probes on a different (healthy) device that later degrades.
+  bool TryClaimDegradedProbeSlot(uint64_t now_ns, uint64_t cooldown_ns) {
+    uint64_t next = await_degraded_next_probe_ns_.load(std::memory_order_relaxed);
+    if (now_ns < next) return false;
+    return await_degraded_next_probe_ns_.compare_exchange_strong(
+        next, now_ns + cooldown_ns, std::memory_order_relaxed);
   }
   // K-7.8 (CONCERN-4 throttle): returns true exactly once per degraded
   // episode (latch set -> first AwaitWarningTryArm -> false on subsequent
@@ -2203,6 +2219,12 @@ class Device : public RuntimeObject {
   // utilization indicator to fall to ~0% during a degraded episode. 0
   // means "never degraded since process start".
   mutable std::atomic<uint64_t> await_degraded_epoch_ns_{0};
+  // V17.5-rc4 Group B: deadline (steady_clock ns) before which the next
+  // post-quiesce-window recovery probe will not be allowed. Updated by
+  // TryClaimDegradedProbeSlot via CAS so concurrent threads converge to
+  // exactly one probe per HIP_DEGRADED_PROBE_COOLDOWN_MS. Zeroed by
+  // ClearAwaitDegraded so probing starts fresh on the next episode.
+  mutable std::atomic<uint64_t> await_degraded_next_probe_ns_{0};
  private:
   const Isa *isa_;                //!< Device isa
   bool IsTypeMatching(cl_device_type type, bool offlineDevices);

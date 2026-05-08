@@ -252,16 +252,11 @@ static std::atomic<size_t> deferred_drop_count_{0};
 // operators can see whether the bounce gate is engaging on the customer site.
 static std::atomic<uint64_t> g_degraded_bounce_count{0};
 
-// V17.5-rc4 Group B: cooldown deadline (steady_clock ns) for recovery probes
-// after the bounce window expires. At most one submit is allowed through
-// per HIP_DEGRADED_PROBE_COOLDOWN_MS (default 100). CAS-protected so 32
-// concurrent threads racing to submit yield exactly one probe.
-static std::atomic<uint64_t> g_next_probe_ns{0};
-
 // V17.5-rc4 Group B: how long after SetAwaitDegraded() do we hard-bounce
 // every new GPU-side submit? Default 1000 ms. After this window expires
-// we throttle recovery probes via g_next_probe_ns. Set to 0 to disable
-// (preserves legacy "always bounce while latched" behavior).
+// we throttle recovery probes via Device::TryClaimDegradedProbeSlot.
+// Set to 0 to disable (preserves legacy "always bounce while latched"
+// behavior).
 static uint64_t DegradedQuiesceMs() {
   static const uint64_t v = EnvU64("HIP_DEGRADED_QUIESCE_MS", 1000);
   return v;
@@ -354,12 +349,14 @@ std::unordered_set<hipArray*> hipArraySet;
 //      bounce 100% — the window during which previously-submitted waves
 //      drain on the GPU and rocm-smi util falls.
 //   5. After the window: rate-limit recovery probes to one every
-//      HIP_DEGRADED_PROBE_COOLDOWN_MS (default 100 ms). The first thread
-//      to win the CAS on g_next_probe_ns is allowed through; everyone
-//      else continues to bounce. If the probe completes successfully,
-//      K-7.5 ClearAwaitDegraded() fires and bouncing stops; if it fails,
-//      SetAwaitDegraded() is re-armed with a fresh epoch_ns, restarting
-//      the quiesce window.
+//      HIP_DEGRADED_PROBE_COOLDOWN_MS (default 100 ms) using a per-device
+//      CAS via Device::TryClaimDegradedProbeSlot — the first thread that
+//      wins the slot is allowed through; everyone else bounces. If the
+//      probe completes successfully, K-7.5 ClearAwaitDegraded() fires
+//      and bouncing stops; if it fails, SetAwaitDegraded() re-arms with
+//      a fresh epoch_ns and the quiesce window restarts. State is
+//      per-device so a degraded device never starves probes on a
+//      different (healthy) device that later degrades.
 // Side effect: increments g_degraded_bounce_count whenever bouncing.
 bool ShouldBounceForDegraded(amd::Device* dev) {
   if (dev == nullptr || !dev->AwaitDegraded()) return false;
@@ -384,16 +381,11 @@ bool ShouldBounceForDegraded(amd::Device* dev) {
   if (epoch_ns != 0 && now_ns - epoch_ns < quiesce_ns) {
     bounce = true;
   } else {
-    // Past the quiesce window: rate-limited recovery probes.
-    uint64_t next = g_next_probe_ns.load(std::memory_order_relaxed);
-    if (now_ns >= next) {
-      const uint64_t cooldown_ns = DegradedProbeCooldownMs() * 1000000ULL;
-      const bool won = g_next_probe_ns.compare_exchange_strong(
-          next, now_ns + cooldown_ns, std::memory_order_relaxed);
-      bounce = !won;
-    } else {
-      bounce = true;
-    }
+    // Past the quiesce window: rate-limited recovery probes. State is
+    // per-device so device 0 going degraded never starves a probe slot
+    // on device 1.
+    const uint64_t cooldown_ns = DegradedProbeCooldownMs() * 1000000ULL;
+    bounce = !dev->TryClaimDegradedProbeSlot(now_ns, cooldown_ns);
   }
   if (bounce) {
     g_degraded_bounce_count.fetch_add(1, std::memory_order_relaxed);
@@ -1033,9 +1025,19 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
   // if the SDMA has recovered. If SDMA is still stuck, the next wait
   // will re-set the degraded latch; if it recovered, the latch clears
   // naturally. Pinned H2D is still allowed through unchanged.
+  //
+  // V17.5-rc4 Group B: gate K-7.11 on ShouldBounceForDegraded instead of
+  // raw AwaitDegraded() so that during the bounce window we still take
+  // the CPU fallback (good) but past the window the rate-limited recovery
+  // probe is permitted to attempt a real SDMA copy — if it succeeds,
+  // K-7.5 auto-clear fires and the device returns to normal; if it
+  // fails, the latch re-arms with a fresh epoch_ns and the window
+  // restarts. This is what lets the customer's service drain the GPU
+  // and then probe for recovery rather than being stuck in CPU fallback
+  // forever.
   const bool isCopyFromDevice = (srcMemory != nullptr && dstMemory == nullptr);
   if (!isHostAsync && (isCopyFromDevice || isPageableH2D) &&
-      stream.device().AwaitDegraded()) {
+      ShouldBounceForDegraded(stream.device().devices()[0])) {
     if (pageableCopyAccounted) {
       GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
     }
