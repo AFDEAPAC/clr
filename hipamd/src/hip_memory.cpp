@@ -36,13 +36,16 @@
 namespace hip {
 
 namespace {
+
 struct ServiceGuardConfig {
   bool enabled;
   bool reject;
+  bool cgroup_aware;
   uint64_t max_bytes;
   uint64_t rate_bytes_per_s;
   uint64_t burst_bytes;
   uint32_t wait_ms;
+  uint64_t cgroup_reserve_bytes;
 };
 
 static std::atomic<uint64_t> g_vram_inflight{0};
@@ -73,6 +76,45 @@ static uint64_t NowNs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// V17.5-rc4 Group A: cgroup memory helpers
+static uint64_t ReadCgroupFile(const char* filename) {
+  FILE* cg = fopen("/proc/self/cgroup", "r");
+  if (!cg) return UINT64_MAX;
+  char line[512], cg_path[256] = "";
+  while (fgets(line, sizeof(line), cg)) {
+    if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+      char* p = line + 3; p[strcspn(p, "\n")] = 0;
+      snprintf(cg_path, sizeof(cg_path), "%s", p); break;
+    }
+  }
+  fclose(cg);
+  if (cg_path[0] == 0) return UINT64_MAX;
+  char path[512];
+  snprintf(path, sizeof(path), "/sys/fs/cgroup%s/%s", cg_path, filename);
+  FILE* f = fopen(path, "r");
+  if (!f) {
+    snprintf(path, sizeof(path), "/sys/fs/cgroup/memory%s/%s", cg_path,
+             strcmp(filename, "memory.max") == 0 ? "memory.limit_in_bytes" :
+             strcmp(filename, "memory.current") == 0 ? "memory.usage_in_bytes" :
+             filename);
+    f = fopen(path, "r");
+    if (!f) return UINT64_MAX;
+  }
+  char buf[64];
+  if (!fgets(buf, sizeof(buf), f)) { fclose(f); return UINT64_MAX; }
+  fclose(f);
+  if (strncmp(buf, "max", 3) == 0) return UINT64_MAX;
+  char* end = nullptr;
+  uint64_t val = strtoull(buf, &end, 10);
+  return (end == buf) ? UINT64_MAX : val;
+}
+static uint64_t ReadCgroupMemLimit()   { return ReadCgroupFile("memory.max"); }
+static uint64_t ReadCgroupMemCurrent() { return ReadCgroupFile("memory.current"); }
+static uint64_t CgroupReservePct() {
+  static const uint64_t v = EnvU64("HIP_HOST_GUARD_CGROUP_RESERVE_PCT", 25);
+  return v;
+}
+
 static ServiceGuardConfig VramGuard() {
   ServiceGuardConfig cfg{};
   cfg.enabled = EnvEnabled("HIP_SERVICE_SURVIVAL");
@@ -90,6 +132,29 @@ static ServiceGuardConfig HostGuard() {
   cfg.enabled = EnvEnabled("HIP_SERVICE_SURVIVAL");
   cfg.reject = EnvReject("HIP_HOST_GUARD_POLICY");
   cfg.max_bytes = EnvU64("HIP_HOST_GUARD_MAX_MB", 0) << 20;
+  cfg.cgroup_aware = false;
+  cfg.cgroup_reserve_bytes = 0;
+
+  // V17.5-rc4 Group A: auto-derive host budget from cgroup when survival
+  // mode is on and no explicit HIP_HOST_GUARD_MAX_MB is set.
+  if (cfg.enabled && cfg.max_bytes == 0) {
+    uint64_t cg_limit = ReadCgroupMemLimit();
+    if (cg_limit != UINT64_MAX && cg_limit > 0) {
+      uint64_t reserve_pct = CgroupReservePct();
+      uint64_t reserve = cg_limit * reserve_pct / 100;
+      cfg.max_bytes = (cg_limit > reserve) ? (cg_limit - reserve) : 0;
+      cfg.reject = true;
+      cfg.cgroup_aware = true;
+      cfg.cgroup_reserve_bytes = reserve;
+      ClPrint(amd::LOG_INFO, amd::LOG_API,
+              "Group A: cgroup host guard auto-derived: limit=%lluMB reserve=%llu%% "
+              "max_host=%lluMB",
+              (unsigned long long)(cg_limit >> 20),
+              (unsigned long long)reserve_pct,
+              (unsigned long long)(cfg.max_bytes >> 20));
+    }
+  }
+
   cfg.rate_bytes_per_s = 0;
   cfg.burst_bytes = 0;
   cfg.wait_ms = static_cast<uint32_t>(EnvU64("HIP_HOST_GUARD_WAIT_MS", 4000));
@@ -184,11 +249,33 @@ static bool TryAccount(std::atomic<uint64_t>& counter, uint64_t bytes,
   }
 }
 
+static std::atomic<uint64_t> g_cgroup_reject_count{0};
+
 static hipError_t GuardBeforeAlloc(const ServiceGuardConfig& cfg,
                                    std::atomic<uint64_t>& counter,
                                    std::atomic<uint64_t>* next_token_ns,
                                    uint64_t bytes) {
   if (!cfg.enabled || !cfg.reject) return hipSuccess;
+
+  // V17.5-rc4 Group A: per-alloc cgroup headroom check for large allocations.
+  // Reads real-time cgroup usage to catch cross-process pressure that the
+  // local counter can't see. Skip for small allocs (<8MB) to avoid overhead.
+  if (cfg.cgroup_aware && bytes >= (8ULL << 20)) {
+    uint64_t cg_current = ReadCgroupMemCurrent();
+    uint64_t cg_limit = ReadCgroupMemLimit();
+    if (cg_limit != UINT64_MAX && cg_current != UINT64_MAX) {
+      uint64_t avail = (cg_limit > cg_current) ? (cg_limit - cg_current) : 0;
+      if (avail < bytes + cfg.cgroup_reserve_bytes) {
+        ClPrint(amd::LOG_WARNING, amd::LOG_API,
+                "Group A cgroup reject: avail=%lluMB need=%lluMB reserve=%lluMB",
+                (unsigned long long)(avail >> 20),
+                (unsigned long long)(bytes >> 20),
+                (unsigned long long)(cfg.cgroup_reserve_bytes >> 20));
+        g_cgroup_reject_count.fetch_add(1, std::memory_order_relaxed);
+        return hipErrorOutOfMemory;
+      }
+    }
+  }
 
   const uint64_t deadline_ns = NowNs() + uint64_t(cfg.wait_ms) * 1000000ULL;
   do {
