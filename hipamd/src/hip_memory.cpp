@@ -82,34 +82,147 @@ static uint64_t NowNs() {
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// V17.5-rc4 Group A: cgroup memory helpers (supports v1 + v2, inside container)
-// Inside a container, the process sees itself as root of its cgroup namespace.
-// So the files are at /sys/fs/cgroup/memory/ (v1) or /sys/fs/cgroup/ (v2).
-static uint64_t ReadCgroupMemVal(const char* filename) {
-  // Try paths in order of likelihood:
-  const char* paths[] = {
-    // v1 inside container (most common for Docker on RHEL/CentOS)
-    "/sys/fs/cgroup/memory/%s",
-    // v2 inside container
-    "/sys/fs/cgroup/%s",
-    nullptr
-  };
-  char path[256];
-  for (int i = 0; paths[i]; i++) {
-    snprintf(path, sizeof(path), paths[i], filename);
-    FILE* f = fopen(path, "r");
-    if (f) {
-      char buf[64];
-      if (fgets(buf, sizeof(buf), f)) {
-        fclose(f);
-        if (strncmp(buf, "max", 3) == 0) return UINT64_MAX;
-        char* end = nullptr;
-        uint64_t val = strtoull(buf, &end, 10);
-        if (end != buf) return val;
-      } else {
-        fclose(f);
+// V17.5-rc4 Group A: cgroup memory helpers (supports v1 + v2, inside container).
+// V17.5-firewall H-3 fix: docker without cgroup-namespace pivot bind-mounts
+// /sys/fs/cgroup from the host root, so the in-container process sees the
+// HOST's root cgroup limits (effectively UINT64_MAX), not the container's
+// scope (e.g. /docker/<id>/). This caused every host-mem firewall axis to
+// be a no-op in our customer's deployment. We now read /proc/self/cgroup
+// to discover the scope path and try the scoped lookup BEFORE falling back
+// to the namespace-pivoted root paths the original code assumed.
+//
+// The scope is read once per process and cached. We use two caches: one
+// for v2 (single unified hierarchy, line "0::<path>") and one for the
+// memory controller in v1 (line "<id>:memory:<path>" or
+// "<id>:...,memory,...:<path>").
+static const std::string& ProcSelfCgroupV2Scope() {
+  static const std::string scope = []() -> std::string {
+    FILE* f = std::fopen("/proc/self/cgroup", "r");
+    if (f == nullptr) return std::string();
+    char line[512];
+    std::string out;
+    while (std::fgets(line, sizeof(line), f)) {
+      // v2 format: "0::/path"
+      if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+        const char* p = line + 3;
+        const char* nl = std::strchr(p, '\n');
+        out.assign(p, nl ? size_t(nl - p) : std::strlen(p));
+        break;
       }
     }
+    std::fclose(f);
+    return out;
+  }();
+  return scope;
+}
+
+static const std::string& ProcSelfCgroupV1MemoryScope() {
+  static const std::string scope = []() -> std::string {
+    FILE* f = std::fopen("/proc/self/cgroup", "r");
+    if (f == nullptr) return std::string();
+    char line[512];
+    std::string out;
+    while (std::fgets(line, sizeof(line), f)) {
+      // v1 format: "<hier_id>:<csv-of-controllers>:<path>"
+      // We look for a controller list that contains "memory".
+      const char* first_colon = std::strchr(line, ':');
+      if (first_colon == nullptr) continue;
+      const char* second_colon = std::strchr(first_colon + 1, ':');
+      if (second_colon == nullptr) continue;
+      // Controllers list: [first_colon+1, second_colon)
+      std::string ctrls(first_colon + 1, size_t(second_colon - (first_colon + 1)));
+      // Match "memory" as a whole token (split on commas).
+      bool has_memory = false;
+      size_t p0 = 0;
+      while (p0 <= ctrls.size()) {
+        size_t p1 = ctrls.find(',', p0);
+        if (p1 == std::string::npos) p1 = ctrls.size();
+        if (ctrls.compare(p0, p1 - p0, "memory") == 0) { has_memory = true; break; }
+        p0 = p1 + 1;
+      }
+      if (!has_memory) continue;
+      const char* p = second_colon + 1;
+      const char* nl = std::strchr(p, '\n');
+      out.assign(p, nl ? size_t(nl - p) : std::strlen(p));
+      break;
+    }
+    std::fclose(f);
+    return out;
+  }();
+  return scope;
+}
+
+static bool ReadOneCgroupFile(const char* path, uint64_t* out) {
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return false;
+  char buf[64];
+  bool got = false;
+  if (std::fgets(buf, sizeof(buf), f)) {
+    if (std::strncmp(buf, "max", 3) == 0) {
+      *out = UINT64_MAX;
+      got = true;
+    } else {
+      char* end = nullptr;
+      uint64_t val = std::strtoull(buf, &end, 10);
+      if (end != buf) { *out = val; got = true; }
+    }
+  }
+  std::fclose(f);
+  return got;
+}
+
+static uint64_t ReadCgroupMemVal(const char* filename) {
+  // V17.5-firewall H-3 fix: try scoped paths first, then fall back to
+  // the namespace-pivoted-root paths the original code assumed.
+  static std::once_flag g_logged_scope_once;
+  char path[512];
+
+  // 1) cgroup v2 in-namespace pivot (path == "/")  ->  /sys/fs/cgroup/<filename>
+  // 2) cgroup v2 host-bind (no pivot)              ->  /sys/fs/cgroup/<v2_scope>/<filename>
+  const std::string& v2 = ProcSelfCgroupV2Scope();
+  if (!v2.empty()) {
+    const char* leading = (v2[0] == '/') ? "" : "/";
+    snprintf(path, sizeof(path), "/sys/fs/cgroup%s%s/%s",
+             leading, v2.c_str(), filename);
+    uint64_t val = 0;
+    if (ReadOneCgroupFile(path, &val)) {
+      std::call_once(g_logged_scope_once, [&]() {
+        ClPrint(amd::LOG_INFO, amd::LOG_API,
+                "V17.5 firewall: cgroup v2 scope=%s file=%s",
+                v2.c_str(), filename);
+      });
+      return val;
+    }
+  }
+
+  // 3) cgroup v1 in-namespace pivot                ->  /sys/fs/cgroup/memory/<filename>
+  // 4) cgroup v1 host-bind                         ->  /sys/fs/cgroup/memory/<v1_scope>/<filename>
+  const std::string& v1 = ProcSelfCgroupV1MemoryScope();
+  if (!v1.empty() && v1 != "/") {
+    const char* leading = (v1[0] == '/') ? "" : "/";
+    snprintf(path, sizeof(path), "/sys/fs/cgroup/memory%s%s/%s",
+             leading, v1.c_str(), filename);
+    uint64_t val = 0;
+    if (ReadOneCgroupFile(path, &val)) {
+      std::call_once(g_logged_scope_once, [&]() {
+        ClPrint(amd::LOG_INFO, amd::LOG_API,
+                "V17.5 firewall: cgroup v1 memory scope=%s file=%s",
+                v1.c_str(), filename);
+      });
+      return val;
+    }
+  }
+
+  // 5) Fall back to original behaviour (in-namespace pivot or root).
+  const char* paths[] = {
+    "/sys/fs/cgroup/memory/%s",  // v1 in-namespace pivot or root
+    "/sys/fs/cgroup/%s",          // v2 in-namespace pivot or root
+    nullptr
+  };
+  for (int i = 0; paths[i]; i++) {
+    snprintf(path, sizeof(path), paths[i], filename);
+    uint64_t val = 0;
+    if (ReadOneCgroupFile(path, &val)) return val;
   }
   return UINT64_MAX;
 }
@@ -118,10 +231,81 @@ static uint64_t ReadCgroupMemLimit() {
   if (v == UINT64_MAX) v = ReadCgroupMemVal("memory.limit_in_bytes"); // v1
   return v;
 }
+// V17.5-firewall: parse memory.stat for a numeric field (e.g. "cache",
+// "inactive_file"). Returns 0 on miss / parse failure (treated as "no
+// reclaimable cache" — conservative for the avail calc).
+static uint64_t ReadCgroupMemStatField(const char* field) {
+  // Reuse the scope-resolver from ReadCgroupMemVal indirectly by going
+  // through the same path-construction logic. We replicate the lookup
+  // order here because we need to find memory.stat specifically (which
+  // exists in both v1 and v2 with different field names but the
+  // "cache" / "file" key prefix happens to be common).
+  char path[512];
+  const std::string& v2 = ProcSelfCgroupV2Scope();
+  if (!v2.empty()) {
+    const char* leading = (v2[0] == '/') ? "" : "/";
+    snprintf(path, sizeof(path), "/sys/fs/cgroup%s%s/memory.stat",
+             leading, v2.c_str());
+    if (access(path, R_OK) != 0) path[0] = '\0';
+  } else {
+    path[0] = '\0';
+  }
+  if (path[0] == '\0') {
+    const std::string& v1 = ProcSelfCgroupV1MemoryScope();
+    if (!v1.empty() && v1 != "/") {
+      const char* leading = (v1[0] == '/') ? "" : "/";
+      snprintf(path, sizeof(path), "/sys/fs/cgroup/memory%s%s/memory.stat",
+               leading, v1.c_str());
+      if (access(path, R_OK) != 0) path[0] = '\0';
+    }
+  }
+  if (path[0] == '\0') {
+    snprintf(path, sizeof(path), "/sys/fs/cgroup/memory/memory.stat");
+    if (access(path, R_OK) != 0) {
+      snprintf(path, sizeof(path), "/sys/fs/cgroup/memory.stat");
+      if (access(path, R_OK) != 0) return 0;
+    }
+  }
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return 0;
+  char line[256];
+  size_t flen = std::strlen(field);
+  uint64_t out = 0;
+  while (std::fgets(line, sizeof(line), f)) {
+    if (std::strncmp(line, field, flen) != 0) continue;
+    if (line[flen] != ' ') continue;
+    char* end = nullptr;
+    uint64_t v = std::strtoull(line + flen + 1, &end, 10);
+    if (end != line + flen + 1) { out = v; }
+    break;
+  }
+  std::fclose(f);
+  return out;
+}
+
 static uint64_t ReadCgroupMemCurrent() {
-  uint64_t v = ReadCgroupMemVal("memory.current");          // v2
-  if (v == UINT64_MAX) v = ReadCgroupMemVal("memory.usage_in_bytes"); // v1
-  return v;
+  // V17.5-firewall: subtract reclaimable page-cache. memory.usage_in_bytes
+  // (v1) and memory.current (v2) both include cache, which can be 25 GB+
+  // on a long-running container even when the workload's anonymous RSS is
+  // tiny. Without this subtraction WouldRejectHostAlloc bounces every
+  // request as soon as the host disk cache fills, even though the kernel
+  // would happily evict that cache under pinning pressure -> firewall
+  // permanent-stuck-at-100%-bounce mode.
+  //
+  // We approximate "non-reclaimable" usage = usage - (active_file +
+  // inactive_file). Both file LRU lists are reclaimable under pressure;
+  // the kernel reclaim path doesn't OOM-kill until BOTH lists are
+  // shrunk. Mapped_file is part of *active_file but is shared with
+  // application VM, so we don't subtract it separately.
+  uint64_t raw = ReadCgroupMemVal("memory.current");          // v2
+  if (raw == UINT64_MAX) raw = ReadCgroupMemVal("memory.usage_in_bytes"); // v1
+  if (raw == UINT64_MAX) return UINT64_MAX;
+
+  uint64_t inactive_file = ReadCgroupMemStatField("inactive_file");
+  uint64_t active_file   = ReadCgroupMemStatField("active_file");
+  uint64_t reclaimable   = inactive_file + active_file;
+  if (reclaimable > raw) reclaimable = raw;
+  return raw - reclaimable;
 }
 static uint64_t CgroupReservePct() {
   static const uint64_t v = EnvU64("HIP_HOST_GUARD_CGROUP_RESERVE_PCT", 25);
@@ -596,6 +780,23 @@ hipError_t WouldRejectHostAlloc(uint64_t bytes,
     if (cg_limit != UINT64_MAX && cg_current != UINT64_MAX) {
       uint64_t avail = (cg_limit > cg_current) ? (cg_limit - cg_current) : 0;
       if (avail < bytes + cfg.cgroup_reserve_bytes) {
+        // V17.5-firewall: throttled diagnostic so we can see the math
+        // on real failures without log-spam (rate-limited by atomic
+        // counter, only every 1000 rejections).
+        static std::atomic<uint64_t> rej_counter{0};
+        uint64_t n = rej_counter.fetch_add(1, std::memory_order_relaxed);
+        if ((n % 1000) == 0) {
+          ClPrint(amd::LOG_WARNING, amd::LOG_API,
+                  "V17.5 firewall WouldReject: bytes=%lluMB cg_curr=%lluMB cg_lim=%lluMB "
+                  "reserve=%lluMB avail=%lluMB needed=%lluMB n=%llu",
+                  (unsigned long long)(bytes >> 20),
+                  (unsigned long long)(cg_current >> 20),
+                  (unsigned long long)(cg_limit >> 20),
+                  (unsigned long long)(cfg.cgroup_reserve_bytes >> 20),
+                  (unsigned long long)(avail >> 20),
+                  (unsigned long long)((bytes + cfg.cgroup_reserve_bytes) >> 20),
+                  (unsigned long long)n);
+        }
         return hipErrorOutOfMemory;
       }
     }

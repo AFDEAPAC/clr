@@ -177,29 +177,38 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
     // weights. Service-survival semantics rely on the auto-clear above
     // plus per-batch hipErrorNotReady rejects, so the GPU context stays
     // intact between transient hangs.
-    if (status == CL_COMPLETE) {
-      if (auto* q = command().queue()) {
-        if (q->device().AwaitDegraded()) {
-          // K-7.5.1 V17.5: only clear if this command was enqueued BEFORE
-          // the current degraded epoch. Commands enqueued during degradation
-          // can complete via SDMA (non-blocked engine) and must NOT clear
-          // the latch — that would create a TOCTOU race where subsequent
-          // sync APIs (hipMemset, hipMemcpy) see a cleared latch and bypass
-          // their entry-gates. Pre-degradation completions (e.g. the hung
-          // kernel finally finishing after gpu_recover) are genuine recovery
-          // signals and DO clear the latch.
-          if (command().enqueueDegradedEpoch() < q->device().AwaitDegradedEpoch()) {
-            q->device().ClearAwaitDegraded();
-          }
+    if (auto* q = command().queue()) {
+      if (status == CL_COMPLETE && q->device().AwaitDegraded()) {
+        // K-7.5.1 V17.5: only clear if this command was enqueued BEFORE
+        // the current degraded epoch. Commands enqueued during degradation
+        // can complete via SDMA (non-blocked engine) and must NOT clear
+        // the latch — that would create a TOCTOU race where subsequent
+        // sync APIs (hipMemset, hipMemcpy) see a cleared latch and bypass
+        // their entry-gates. Pre-degradation completions (e.g. the hung
+        // kernel finally finishing after gpu_recover) are genuine recovery
+        // signals and DO clear the latch. Negative status (CL error /
+        // cancel) is NOT a healthy progress signal and leaves the latch
+        // alone, so a hard-hung GPU keeps fail-fasting until the
+        // supervisor restarts the process.
+        if (command().enqueueDegradedEpoch() < q->device().AwaitDegradedEpoch()) {
+          q->device().ClearAwaitDegraded();
         }
-        // V17.5 firewall: symmetric decrement of per-stream pending
-        // counter. Bumped in HostQueue::append(); dropped here exactly
-        // once when the command finally reaches CL_COMPLETE. Skipped
-        // for non-HostQueue queues (DeviceQueue, OoO queue) which do
-        // not participate in the firewall picker.
-        if (auto* hq = q->asHostQueue()) {
-          hq->DecPending();
-        }
+      }
+      // V17.5 firewall (H-1 fix): symmetric decrement of per-stream
+      // pending counter. Bumped in HostQueue::append() for every
+      // command, including ones that subsequently transition to a
+      // negative error status (e.g. CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST
+      // raised by HostQueue::finish() during AwaitDegraded, by the
+      // service-survival HW-event-not-ready short-circuit, or by a
+      // dependency-failed command in HostQueue::loop). The decrement
+      // therefore must fire on ANY terminal status (status <= CL_COMPLETE),
+      // not just on CL_COMPLETE — otherwise the counter drifts upward
+      // under degradation and the firewall's least-loaded picker sees
+      // the stream as permanently saturated. Skipped for non-HostQueue
+      // queues (DeviceQueue, OoO queue) which do not participate in the
+      // firewall picker.
+      if (auto* hq = q->asHostQueue()) {
+        hq->DecPending();
       }
     }
 
