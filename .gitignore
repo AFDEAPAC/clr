@@ -46,7 +46,15 @@ install/
 *.swo
 build_632/
 build_6_3/
+build_631/
+build_*/
 build/
 *.o
 *.so
 *.so.*
+
+# Generated install-time wrapper headers (cmake configures these into build dir,
+# they should NOT live in src tree; ignore stray copies.)
+/hipamd/include/hip/*.h
+/hipamd/VERSION
+/hipamd/hip-lang-config.cmake.in
