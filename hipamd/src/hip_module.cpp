@@ -385,18 +385,18 @@ hipError_t ihipModuleLaunchKernel(hipFunction_t f, uint32_t globalWorkSizeX,
   if (globalWorkSizeZ < blockDimZ) blockDimZ = globalWorkSizeZ;
 
   auto device = g_devices[deviceId]->devices()[0];
-  // V17.5-rc4 Group B (GPU 100% relax): if the device is in a degraded
-  // episode, drop new kernel submits during the bounce window so that
-  // already-queued waves can retire and rocm-smi GPU util can fall to
-  // ~0%. Without this gate, application-level retry loops (e.g. PyTorch
-  // serving's request handler) keep stuffing fresh kernels into the AQL
-  // queue while the device is broken, masking the failure as 100% util.
-  // After the bounce window expires, ShouldBounceForDegraded samples
-  // 1/8 of submits as recovery probes — those that complete trigger
-  // K-7.5 ClearAwaitDegraded() and the device is allowed back in service.
-  if (ShouldBounceForDegraded(device)) {
-    return hipErrorNotReady;
-  }
+  // V17.5-rc4 Group B revision: do NOT bounce kernel launches. The
+  // degraded state means SDMA (copy engine) is stuck, but the compute
+  // engine is fine. Bouncing kernel launches kills throughput unnecessarily
+  // — the customer's inference kernels can still run even when hipMemcpy
+  // is failing. Letting kernels through also means K-7.5 auto-clear can
+  // fire from kernel completion, enabling recovery without probes.
+  //
+  // SDMA-dependent operations (hipMemcpy, hipMemset) are still bounced
+  // via ShouldBounceForDegraded() in hip_memory.cpp.
+  //
+  // This matches NVIDIA's architecture where copy engine failure is
+  // per-stream and does not affect compute queue dispatch.
   // Check if it's a uniform kernel and validate dimensions
   if (kernel->getDeviceKernel(*device)->getUniformWorkGroupSize()) {
     if (((globalWorkSizeX % blockDimX) != 0) ||
