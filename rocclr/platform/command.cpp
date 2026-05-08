@@ -192,6 +192,14 @@ bool Event::setStatus(int32_t status, uint64_t timeStamp) {
             q->device().ClearAwaitDegraded();
           }
         }
+        // V17.5 firewall: symmetric decrement of per-stream pending
+        // counter. Bumped in HostQueue::append(); dropped here exactly
+        // once when the command finally reaches CL_COMPLETE. Skipped
+        // for non-HostQueue queues (DeviceQueue, OoO queue) which do
+        // not participate in the firewall picker.
+        if (auto* hq = q->asHostQueue()) {
+          hq->DecPending();
+        }
       }
     }
 

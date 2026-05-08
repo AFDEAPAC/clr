@@ -350,6 +350,10 @@ void HostQueue::append(Command& command) {
   }
   command.retain();
   command.setStatus(CL_QUEUED);
+  // V17.5 firewall: bump the per-stream pending counter symmetrically
+  // with the retain above. Decrement happens in Event::setStatus when
+  // the command transitions to CL_COMPLETE (see command.cpp).
+  IncPending();
   queue_.enqueue(&command);
   if (!IS_HIP) {
     return;

@@ -532,6 +532,13 @@ public:
     hip::Stream* NullStream(bool wait = true);
     Stream* GetNullStream() const {return null_stream_;};
 
+    // V17.5 firewall — read-only snapshot of the device's live stream
+    // set. Caller must hold StreamSetLock() while iterating. Returning
+    // a const ref avoids copying the set on every dumper tick. Used by
+    // StartFirewallDebugDumperOnce()'s 200ms snapshot loop.
+    amd::Monitor& StreamSetLock() { return streamSetLock; }
+    const std::unordered_set<hip::Stream*>& StreamSet() const { return streamSet; }
+
     void SetActiveStatus() {
       isActive_ = true;
     }
@@ -685,5 +692,27 @@ public:
   // hip_module.cpp etc. so kernel launches can drop new GPU work during the
   // post-degraded quiesce window. Defined in hip_memory.cpp.
   extern bool ShouldBounceForDegraded(amd::Device* dev);
+
+  // V17.5 firewall — predicate version of GuardBeforeAlloc's cgroup
+  // pre-check. Returns hipSuccess if the allocation would be admitted,
+  // hipErrorOutOfMemory if it would be rejected. Does NOT modify the
+  // host-inflight counter. Used by hipExtHostMemBudgetExceeded.
+  hipError_t WouldRejectHostAlloc(uint64_t bytes,
+                                  uint64_t* used_out,
+                                  uint64_t* limit_out);
+
+  // V17.5 firewall — read host-inflight + degraded latch primitives
+  // for debugfs export.
+  uint64_t  HostInflightBytes();
+  uint64_t  HostBudgetLimitBytes();
+
+  // V17.5 firewall — start the userspace debugfs-equivalent dumper
+  // (idempotent / safe to call repeatedly). When env HIP_FIREWALL_DEBUGFS=1
+  // (or =true), launches one background thread that writes a JSON
+  // snapshot to ${HIP_FIREWALL_DEBUGFS_PATH:-/tmp/hip-firewall}/<pid>/snapshot.json
+  // every HIP_FIREWALL_DEBUGFS_PERIOD_MS (default 200) ms. Snapshot
+  // contains host_inflight, per-device degraded state, per-stream
+  // pending counts. Used by multidim_sampler.sh.
+  void StartFirewallDebugDumperOnce();
 } // namespace hip
 #endif  // HIP_SRC_HIP_INTERNAL_H

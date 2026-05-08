@@ -22,8 +22,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <hip/hip_runtime.h>
 #include "hip_internal.hpp"
@@ -146,7 +152,11 @@ static ServiceGuardConfig HostGuard() {
   // mode is on and no explicit HIP_HOST_GUARD_MAX_MB is set.
   if (cfg.enabled && cfg.max_bytes == 0) {
     uint64_t cg_limit = ReadCgroupMemLimit();
-            (unsigned long long)cg_limit, (int)cfg.enabled, (unsigned long long)cfg.max_bytes);
+    ClPrint(amd::LOG_DEBUG, amd::LOG_API,
+            "Group A: cg_limit=%lluMB enabled=%d max_bytes_initial=%llu",
+            (unsigned long long)(cg_limit >> 20),
+            (int)cfg.enabled,
+            (unsigned long long)cfg.max_bytes);
     if (cg_limit != UINT64_MAX && cg_limit > 0) {
       uint64_t reserve_pct = CgroupReservePct();
       uint64_t reserve = cg_limit * reserve_pct / 100;
@@ -553,6 +563,259 @@ bool ShouldBounceForDegraded(amd::Device* dev) {
     g_degraded_bounce_count.fetch_add(1, std::memory_order_relaxed);
   }
   return bounce;
+}
+
+// ================================================================================================
+// V17.5 firewall — public-API implementations.
+// (Already inside the master `namespace hip { ... }` opened at line 42.)
+// ================================================================================================
+
+// Predicate version of GuardBeforeAlloc's cgroup-aware pre-check that
+// does NOT mutate g_host_inflight. Mirrors the math in
+// GuardBeforeAlloc(HostGuard(), g_host_inflight, ...) so the customer's
+// admission gate sees exactly the same "would I be rejected?" answer
+// the allocation path itself would produce.
+hipError_t WouldRejectHostAlloc(uint64_t bytes,
+                                uint64_t* used_out,
+                                uint64_t* limit_out) {
+  const ServiceGuardConfig cfg = HostGuard();
+
+  // Always populate the optional out-pointers so callers can render
+  // metrics even when survival mode is off.
+  if (used_out  != nullptr) *used_out  = g_host_inflight.load(std::memory_order_relaxed);
+  if (limit_out != nullptr) *limit_out = cfg.max_bytes;
+
+  if (!cfg.enabled || !cfg.reject) {
+    return hipSuccess;
+  }
+
+  // Mirror cgroup-aware large-alloc check from GuardBeforeAlloc.
+  if (cfg.cgroup_aware && bytes >= (8ULL << 20)) {
+    uint64_t cg_current = ReadCgroupMemCurrent();
+    uint64_t cg_limit   = ReadCgroupMemLimit();
+    if (cg_limit != UINT64_MAX && cg_current != UINT64_MAX) {
+      uint64_t avail = (cg_limit > cg_current) ? (cg_limit - cg_current) : 0;
+      if (avail < bytes + cfg.cgroup_reserve_bytes) {
+        return hipErrorOutOfMemory;
+      }
+    }
+  }
+
+  // Mirror local-counter check from TryAccount: would
+  // (g_host_inflight + bytes) exceed cfg.max_bytes?
+  if (cfg.max_bytes != 0) {
+    uint64_t in_use = g_host_inflight.load(std::memory_order_relaxed);
+    if (in_use + bytes > cfg.max_bytes) {
+      return hipErrorOutOfMemory;
+    }
+  }
+
+  return hipSuccess;
+}
+
+uint64_t HostInflightBytes() {
+  return g_host_inflight.load(std::memory_order_relaxed);
+}
+
+uint64_t HostBudgetLimitBytes() {
+  return HostGuard().max_bytes;
+}
+
+// ================================================================================================
+// V17.5 firewall — userspace "debugfs"-equivalent dumper.
+//
+// CLR is a userspace library so it cannot create entries in
+// /sys/kernel/debug/. Instead, when the customer sets
+// HIP_FIREWALL_DEBUGFS=1, a single background thread is spawned that
+// writes a JSON snapshot to ${HIP_FIREWALL_DEBUGFS_PATH:-/tmp/hip-firewall}/
+// <pid>/snapshot.json every HIP_FIREWALL_DEBUGFS_PERIOD_MS (default 200) ms.
+//
+// The multidim_sampler.sh reads that file as if it were a debugfs entry.
+// Cost: one thread, one syscall per period. Idempotent; safe to call
+// from multiple init paths. (Already inside namespace hip.)
+// ================================================================================================
+
+static std::once_flag g_firewall_dumper_once;
+static std::atomic<bool> g_firewall_dumper_running{false};
+
+static std::string EnvStringHipFirewall(const char* name, const char* dflt) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return std::string(dflt);
+  return std::string(v);
+}
+
+static void FirewallDumperLoop(std::string base_dir, uint32_t period_ms) {
+  // Per-PID subdirectory so a multi-process customer (8 ranks per host
+  // is common) doesn't have its 8 dumps overwrite each other.
+  pid_t pid = ::getpid();
+  std::string dir  = base_dir + "/" + std::to_string(pid);
+  std::string path = dir + "/snapshot.json";
+  std::string tmp  = path + ".tmp";
+
+  // Best-effort mkdir -p. Non-fatal if base_dir already exists or the
+  // user doesn't have write permission — we just keep retrying.
+  ::mkdir(base_dir.c_str(), 0755);
+  ::mkdir(dir.c_str(), 0755);
+
+  while (g_firewall_dumper_running.load(std::memory_order_relaxed)) {
+    FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f != nullptr) {
+      std::fprintf(f, "{\n");
+      std::fprintf(f, "  \"ts_ns\": %llu,\n", (unsigned long long)NowNs());
+      std::fprintf(f, "  \"pid\": %d,\n", pid);
+      std::fprintf(f, "  \"host_inflight\": %llu,\n",
+                   (unsigned long long)HostInflightBytes());
+      std::fprintf(f, "  \"host_budget_limit\": %llu,\n",
+                   (unsigned long long)HostBudgetLimitBytes());
+      std::fprintf(f, "  \"devices\": [\n");
+      bool first_dev = true;
+      for (size_t d = 0; d < g_devices.size(); ++d) {
+        hip::Device* hd = g_devices[d];
+        if (hd == nullptr) continue;
+        amd::Device* dev = hd->devices()[0];
+        if (dev == nullptr) continue;
+        if (!first_dev) std::fprintf(f, ",\n");
+        first_dev = false;
+        const int degraded = dev->AwaitDegraded() ? 1 : 0;
+        std::fprintf(f, "    {\"id\": %zu, \"degraded\": %d, ", d, degraded);
+        std::fprintf(f, "\"streams\": [");
+        bool first_s = true;
+        amd::ScopedLock l(hd->StreamSetLock());
+        for (auto* s : hd->StreamSet()) {
+          if (s == nullptr) continue;
+          if (!first_s) std::fprintf(f, ", ");
+          first_s = false;
+          std::fprintf(f, "{\"sid\": \"0x%lx\", \"pending\": %u}",
+                       (unsigned long)s, s->PendingCount());
+        }
+        std::fprintf(f, "]}");
+      }
+      std::fprintf(f, "\n  ]\n}\n");
+      std::fclose(f);
+      // Atomic-ish swap. rename(2) on the same FS is atomic w.r.t. open()
+      // by the sampler; partial writes are never observed.
+      ::rename(tmp.c_str(), path.c_str());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(period_ms));
+  }
+
+  // Best-effort cleanup on shutdown.
+  ::unlink(path.c_str());
+  ::unlink(tmp.c_str());
+  ::rmdir(dir.c_str());
+}
+
+void StartFirewallDebugDumperOnce() {
+  std::call_once(g_firewall_dumper_once, []() {
+    if (!EnvEnabled("HIP_FIREWALL_DEBUGFS")) return;
+    std::string base = EnvStringHipFirewall("HIP_FIREWALL_DEBUGFS_PATH",
+                                           "/tmp/hip-firewall");
+    uint32_t period_ms = static_cast<uint32_t>(
+        EnvU64("HIP_FIREWALL_DEBUGFS_PERIOD_MS", 200));
+    g_firewall_dumper_running.store(true, std::memory_order_relaxed);
+    std::thread t(FirewallDumperLoop, base, period_ms);
+    t.detach();
+    ClPrint(amd::LOG_INFO, amd::LOG_API,
+            "V17.5 firewall: debugfs dumper started base=%s period=%ums",
+            base.c_str(), period_ms);
+  });
+}
+
+// ================================================================================================
+extern "C" hipError_t hipExtIsDeviceDegraded(int device,
+                                             int* is_degraded,
+                                             uint64_t* quiesce_remaining_ms) {
+  HIP_INIT_API(NONE, device, is_degraded, quiesce_remaining_ms);
+  StartFirewallDebugDumperOnce();
+
+  if (is_degraded == nullptr) {
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+  if (device < 0 || device >= static_cast<int>(g_devices.size()) || g_devices[device] == nullptr) {
+    HIP_RETURN(hipErrorInvalidDevice);
+  }
+  amd::Device* dev = g_devices[device]->devices()[0];
+  if (dev == nullptr) {
+    HIP_RETURN(hipErrorInvalidDevice);
+  }
+
+  *is_degraded = dev->AwaitDegraded() ? 1 : 0;
+
+  if (quiesce_remaining_ms != nullptr) {
+    if (*is_degraded == 0) {
+      *quiesce_remaining_ms = 0;
+    } else {
+      const uint64_t quiesce_ms = DegradedQuiesceMs();
+      if (quiesce_ms == 0) {
+        // Permanent-bounce mode (legacy): no defined quiesce window.
+        *quiesce_remaining_ms = UINT64_MAX;
+      } else {
+        const uint64_t epoch_ns = dev->AwaitDegradedEpochNs();
+        if (epoch_ns == 0) {
+          *quiesce_remaining_ms = quiesce_ms;
+        } else {
+          const uint64_t now_ns = NowNs();
+          const uint64_t end_ns = epoch_ns + quiesce_ms * 1000000ULL;
+          *quiesce_remaining_ms = (now_ns >= end_ns)
+              ? 0 : (end_ns - now_ns) / 1000000ULL;
+        }
+      }
+    }
+  }
+  HIP_RETURN(hipSuccess);
+}
+
+// ================================================================================================
+extern "C" hipError_t hipExtStreamPendingCount(hipStream_t stream,
+                                               uint32_t* pending) {
+  HIP_INIT_API(NONE, stream, pending);
+  StartFirewallDebugDumperOnce();
+
+  if (pending == nullptr) {
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+
+  // Default-stream resolution: nullptr maps to the current device's
+  // null queue, matching how torch/PyTorch's getCurrentHIPStream(0)
+  // behaves at submit time.
+  Stream* hs = nullptr;
+  if (stream == nullptr || stream == hipStreamPerThread) {
+    Device* dev = getCurrentDevice();
+    if (dev == nullptr) {
+      HIP_RETURN(hipErrorNotInitialized);
+    }
+    hs = dev->GetNullStream();
+  } else {
+    if (!isValid(stream)) {
+      HIP_RETURN(hipErrorInvalidResourceHandle);
+    }
+    hs = reinterpret_cast<Stream*>(stream);
+  }
+  if (hs == nullptr) {
+    *pending = 0;
+    HIP_RETURN(hipSuccess);
+  }
+  *pending = hs->PendingCount();
+  HIP_RETURN(hipSuccess);
+}
+
+// ================================================================================================
+extern "C" hipError_t hipExtHostMemBudgetExceeded(size_t want_bytes,
+                                                  int* would_reject,
+                                                  uint64_t* used_bytes,
+                                                  uint64_t* limit_bytes) {
+  HIP_INIT_API(NONE, want_bytes, would_reject, used_bytes, limit_bytes);
+  StartFirewallDebugDumperOnce();
+
+  if (would_reject == nullptr) {
+    HIP_RETURN(hipErrorInvalidValue);
+  }
+  uint64_t used = 0, limit = 0;
+  hipError_t s = WouldRejectHostAlloc(static_cast<uint64_t>(want_bytes), &used, &limit);
+  *would_reject = (s == hipSuccess) ? 0 : 1;
+  if (used_bytes  != nullptr) *used_bytes  = used;
+  if (limit_bytes != nullptr) *limit_bytes = limit;
+  HIP_RETURN(hipSuccess);
 }
 
 // ================================================================================================

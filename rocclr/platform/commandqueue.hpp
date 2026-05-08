@@ -31,6 +31,8 @@
 #include "thread/thread.hpp"
 #include "platform/object.hpp"
 #include "platform/command.hpp"
+
+#include <atomic>
 /*! \brief Holds commands that will be executed on a specific device.
  *
  *  \details A command queue is created on a specific device in
@@ -291,6 +293,47 @@ class HostQueue : public CommandQueue {
   //! Get queue status
   bool GetQueueStatus() { return isActive_; }
 
+  //
+  // V17.5 firewall — per-stream "pending" counter.
+  //
+  // Definition: number of commands appended via append() that have NOT
+  // yet reached CL_COMPLETE. Mirrors the customer's intuition of
+  // "depth on this stream right now".
+  //
+  // Increment site: HostQueue::append() (commandqueue.cpp).
+  // Decrement site: Event::setStatus(CL_COMPLETE,...) in command.cpp,
+  //   exactly once per command, immediately before the final release()
+  //   that drops the append-time retain. Both sites are reachable on
+  //   every IS_HIP enqueue path (kernel launches, async memcpys, marker
+  //   commands) so the counter is symmetric without further plumbing.
+  //
+  // Read-only accessor for hipExtStreamPendingCount(). Memory order is
+  // relaxed because consumers (firewall picker, debugfs) do not require
+  // synchronization w.r.t. command ordering — they only need an
+  // approximate, non-stale count.
+  //
+  uint32_t PendingCount() const {
+    return pending_count_.load(std::memory_order_relaxed);
+  }
+  void IncPending() {
+    pending_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+  void DecPending() {
+    // Saturated decrement: if the counter is already zero (race during
+    // queue teardown, or a duplicate completion path) leave it pinned at
+    // zero rather than wrapping. Guards the firewall picker against
+    // garbage-billions readings.
+    uint32_t expected = pending_count_.load(std::memory_order_relaxed);
+    while (expected > 0) {
+      if (pending_count_.compare_exchange_weak(
+              expected, expected - 1,
+              std::memory_order_relaxed,
+              std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
 private:
   Command* head_;     //!< Head of the batch list
   Command* tail_;     //!< Tail of the batch list
@@ -298,6 +341,9 @@ private:
 
   //! True if this command queue is active
   bool isActive_;
+
+  //! V17.5 firewall — per-stream pending counter (see PendingCount()).
+  std::atomic<uint32_t> pending_count_{0};
 };
 
 class DeviceQueue : public CommandQueue {

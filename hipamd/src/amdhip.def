@@ -57,6 +57,10 @@ hipExtLaunchMultiKernelMultiDevice
 hipExtMallocWithFlags
 hipExtModuleLaunchKernel
 hipExtLaunchKernel
+; V17.5 firewall query APIs (delivery/v17.5-firewall)
+hipExtIsDeviceDegraded
+hipExtStreamPendingCount
+hipExtHostMemBudgetExceeded
 hipFree
 hipFreeArray
 hipFuncSetAttribute

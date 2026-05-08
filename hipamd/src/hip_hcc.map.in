@@ -578,3 +578,15 @@ global:
 local:
     *;
 } hip_6.1;
+
+# V17.5 firewall (delivery/v17.5-firewall) — query APIs added on top
+# of hip_6.5. Customers binding by name (no version pin) get these
+# automatically; older binaries see no behavior change.
+hip_6.5_firewall {
+global:
+    hipExtIsDeviceDegraded;
+    hipExtStreamPendingCount;
+    hipExtHostMemBudgetExceeded;
+local:
+    *;
+} hip_6.2;
