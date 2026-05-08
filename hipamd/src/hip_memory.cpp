@@ -272,6 +272,67 @@ static uint64_t DegradedProbeCooldownMs() {
   return v;
 }
 
+// V17.5-rc4 Group B test helper: manual degraded injection.
+//
+// Why this exists:
+//   The customer-side dmesg shows ~14k WAIT_EVENTS survival timeouts per
+//   24h, which means real workloads will trip SetAwaitDegraded() many
+//   times via the regular survival path. But the in-tree reproducer
+//   (torch_service_sim) does not have the cross-process GTT contention
+//   that the real fleet has, so the survival path never fires there and
+//   the Group B bounce gate / recovery probe logic cannot be exercised
+//   in CI/regression runs.
+//
+//   This helper, gated entirely on HIP_FORCE_DEGRADED_AFTER_MS, fires
+//   SetAwaitDegraded() exactly once per process after the configured
+//   uptime so a test harness can observe:
+//     * gpu_busy_percent fall during the HIP_DEGRADED_QUIESCE_MS window,
+//     * recovery probes trickle through (one per
+//       HIP_DEGRADED_PROBE_COOLDOWN_MS),
+//     * a successful probe drives K-7.5 ClearAwaitDegraded() and
+//       gpu_busy_percent climbs back to baseline,
+//     * g_degraded_bounce_count counter increments during the bounce
+//       window.
+//
+// Safety:
+//   * Default 0 (env unset) means a single read of an env-derived
+//     static plus one branch — no behavior change for production.
+//   * Fire-once per process. After K-7.5 clears the latch we do NOT
+//     re-arm, so recovery is observable end-to-end.
+//   * If a real survival timeout has already latched the device we
+//     latch fired=true and skip injection so the natural recovery
+//     path is unaffected.
+//   * Uses the same SetAwaitDegraded() entry point that the real
+//     survival path uses, so it cannot widen the abort surface.
+static void MaybeForceDegradedForTest(amd::Device* dev) {
+  static const uint64_t fire_after_ms =
+      EnvU64("HIP_FORCE_DEGRADED_AFTER_MS", 0);
+  if (fire_after_ms == 0) return;
+
+  static std::atomic<bool> fired{false};
+  if (fired.load(std::memory_order_acquire)) return;
+
+  if (dev->AwaitDegraded()) {
+    fired.store(true, std::memory_order_release);
+    return;
+  }
+
+  static const uint64_t start_ns = NowNs();
+  const uint64_t now_ns = NowNs();
+  if ((now_ns - start_ns) / 1000000ULL < fire_after_ms) return;
+
+  bool expected = false;
+  if (fired.compare_exchange_strong(expected, true,
+                                    std::memory_order_acq_rel,
+                                    std::memory_order_acquire)) {
+    dev->SetAwaitDegraded();
+    ClPrint(amd::LOG_WARNING, amd::LOG_API,
+            "HIP_FORCE_DEGRADED_AFTER_MS=%llu fired (test-only): forcing "
+            "device into degraded latch to validate Group B bounce gate",
+            static_cast<unsigned long long>(fire_after_ms));
+  }
+}
+
 static size_t DeferFree(void* ptr, int device_id) {
   std::vector<DeferredFreeEntry> evicted;
   size_t qsz;
@@ -359,7 +420,13 @@ std::unordered_set<hipArray*> hipArraySet;
 //      different (healthy) device that later degrades.
 // Side effect: increments g_degraded_bounce_count whenever bouncing.
 bool ShouldBounceForDegraded(amd::Device* dev) {
-  if (dev == nullptr || !dev->AwaitDegraded()) return false;
+  if (dev == nullptr) return false;
+  // V17.5-rc4 Group B test hook: optional manual degraded injection
+  // (HIP_FORCE_DEGRADED_AFTER_MS). Default 0 = no-op; safe to call on
+  // every submit. Must run before the AwaitDegraded() early-return
+  // below so it can latch the device on first eligible call.
+  MaybeForceDegradedForTest(dev);
+  if (!dev->AwaitDegraded()) return false;
   // When SERVICE_SURVIVAL is off, preserve the original K-7.x behavior of
   // always bouncing while the latch is on (no quiesce window, no recovery
   // probe). The latch is only set from inside survival-mode code paths
