@@ -184,14 +184,25 @@ add_to_config(_versionInfo HIP_VERSION_MINOR)
 add_to_config(_versionInfo HIP_VERSION_PATCH)
 add_to_config(_versionInfo HIP_VERSION_GITHASH)
 
-set (HIP_LIB_VERSION_MAJOR ${HIP_VERSION_MAJOR})
-set (HIP_LIB_VERSION_MINOR ${HIP_VERSION_MINOR})
-if (${ROCM_PATCH_VERSION} )
-   set (HIP_LIB_VERSION_PATCH ${ROCM_PATCH_VERSION})
-elseif (DEFINED HIP_VERSION_GITHASH)
-   set (HIP_LIB_VERSION_PATCH ${HIP_VERSION_PATCH}-${HIP_VERSION_GITHASH})
-else ()
-   set (HIP_LIB_VERSION_PATCH ${HIP_VERSION_PATCH})
+# V17.5-rc4 firewall debug build: allow CMake -D override of the
+# libamdhip64 SONAME / file-version triplet so the produced .so can be
+# named e.g. "libamdhip64.so.6.3.6030001" (SONAME .so.6) — matching the
+# stock ROCm 6.3.0.1 layout for drop-in replacement at customer sites
+# without any /opt/rocm/lib symlink hacks.
+if (NOT DEFINED HIP_LIB_VERSION_MAJOR)
+  set (HIP_LIB_VERSION_MAJOR ${HIP_VERSION_MAJOR})
+endif ()
+if (NOT DEFINED HIP_LIB_VERSION_MINOR)
+  set (HIP_LIB_VERSION_MINOR ${HIP_VERSION_MINOR})
+endif ()
+if (NOT DEFINED HIP_LIB_VERSION_PATCH)
+  if (${ROCM_PATCH_VERSION} )
+     set (HIP_LIB_VERSION_PATCH ${ROCM_PATCH_VERSION})
+  elseif (DEFINED HIP_VERSION_GITHASH)
+     set (HIP_LIB_VERSION_PATCH ${HIP_VERSION_PATCH}-${HIP_VERSION_GITHASH})
+  else ()
+     set (HIP_LIB_VERSION_PATCH ${HIP_VERSION_PATCH})
+  endif ()
 endif ()
 set (HIP_LIB_VERSION_STRING "${HIP_LIB_VERSION_MAJOR}.${HIP_LIB_VERSION_MINOR}.${HIP_LIB_VERSION_PATCH}")
 
