@@ -350,10 +350,12 @@ void HostQueue::append(Command& command) {
   }
   command.retain();
   command.setStatus(CL_QUEUED);
-  // V17.5 firewall: bump the per-stream pending counter symmetrically
-  // with the retain above. Decrement happens in Event::setStatus when
-  // the command transitions to CL_COMPLETE (see command.cpp).
-  IncPending();
+  // V17.5 firewall: per-stream pending counter is incremented in
+  // Command::enqueue() instead of here. With AMD_DIRECT_DISPATCH=ON
+  // (the HIP default), the direct-dispatch branch in Command::enqueue()
+  // bypasses HostQueue::append() entirely, so an Inc placed here would
+  // never fire on the hot path and the firewall's depth-axis check
+  // would always see 0. See Group D fix comment in command.cpp.
   queue_.enqueue(&command);
   if (!IS_HIP) {
     return;

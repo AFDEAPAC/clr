@@ -489,6 +489,19 @@ void Command::enqueue() {
   // auto-clear can distinguish pre-degradation commands from in-degradation ones.
   setEnqueueDegradedEpoch(queue_->device().AwaitDegradedEpoch());
 
+  // V17.5-rc4 Group D fix: bump the per-stream pending counter HERE,
+  // not in HostQueue::append(). When AMD_DIRECT_DISPATCH is ON (the
+  // HIP default), the direct-dispatch branch below submits without
+  // ever calling queue_->append(), so an Inc placed in append() never
+  // fires and pending_count_ stays pinned at 0 — making
+  // hipExtStreamPendingCount and the depth-axis bounce a no-op. Doing
+  // the Inc at this single chokepoint covers BOTH the direct-dispatch
+  // and the legacy queue->append+flush paths exactly once. The Dec
+  // remains in Event::setStatus on terminal status.
+  if (auto* hq = queue_->asHostQueue()) {
+    hq->IncPending();
+  }
+
   if (Agent::shouldPostEventEvents() && type_ != 0) {
     Agent::postEventCreate(as_cl(static_cast<Event*>(this)), type_);
   }

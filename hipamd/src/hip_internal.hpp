@@ -693,6 +693,14 @@ public:
   // post-degraded quiesce window. Defined in hip_memory.cpp.
   extern bool ShouldBounceForDegraded(amd::Device* dev);
 
+  // V17.5-rc4 Group D (depth-axis): bounce gate that returns true when the
+  // per-stream pending_count_ is at-or-above HIP_STREAM_DEPTH_MAX_PENDING.
+  // Default cap = 0 (disabled). Wired into the same three sites as
+  // ShouldBounceForDegraded so a backpressured stream returns
+  // hipErrorNotReady instead of letting the queue grow without bound.
+  // Defined in hip_memory.cpp.
+  extern bool ShouldBounceForDepth(amd::HostQueue* q);
+
   // V17.5 firewall — predicate version of GuardBeforeAlloc's cgroup
   // pre-check. Returns hipSuccess if the allocation would be admitted,
   // hipErrorOutOfMemory if it would be rejected. Does NOT modify the

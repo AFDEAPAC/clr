@@ -750,6 +750,64 @@ bool ShouldBounceForDegraded(amd::Device* dev) {
 }
 
 // ================================================================================================
+// V17.5-rc4 Group D — per-stream depth-axis bounce.
+//
+// Why this axis exists:
+//   Customer reproducer shows that even when (1) device is healthy
+//   (no degraded latch) and (2) host pinned cgroup has headroom, a
+//   client thread can still pile up hundreds of in-flight commands on
+//   a single stream by issuing hipMemcpyAsync / kernel launch faster
+//   than the GPU can drain. The pending_count_ on amd::HostQueue
+//   inflates linearly. Customer code then either runs out of host
+//   staging memory (because every async op holds a stage buffer) or
+//   trips the customer-side WAIT_EVENTS timeout.
+//
+// What this gate does:
+//   Same shape as ShouldBounceForDegraded() — predicate that returns
+//   true when the per-stream pending_count_ is at-or-above
+//   HIP_STREAM_DEPTH_MAX_PENDING. Wired into the same three sites
+//   (ihipMemcpy, async DtoH, sync/event) so a back-pressured stream
+//   gives the customer hipErrorNotReady instead of letting the queue
+//   inflate without bound.
+//
+// Why default OFF:
+//   "Right" max-depth is workload-dependent (LLM serving with 8 cards
+//   ≠ batch image classification ≠ single-stream HPC). Shipping a
+//   global default would mis-fire on the majority of deployments.
+//   Customer that already wires hipExtStreamPendingCount() into their
+//   admission control gets full benefit from the API alone; this gate
+//   is for customers who want CLR to enforce the cap without changing
+//   their app code (LD_PRELOAD + ENV only).
+//
+// Why hipErrorNotReady (not OutOfMemory):
+//   Matches the degraded gate's return code — the customer's existing
+//   error path already treats hipErrorNotReady as "back off, retry
+//   later" and does not abort the worker. Returning OutOfMemory from
+//   a non-allocating call would be misleading.
+static std::atomic<uint64_t> g_depth_bounce_count{0};
+
+static uint64_t StreamDepthMaxPending() {
+  static const uint64_t v = EnvU64("HIP_STREAM_DEPTH_MAX_PENDING", 0);
+  return v;
+}
+
+// Predicate: true if this stream is at-or-above the configured depth
+// cap. Reads the relaxed atomic counter — this is the same value that
+// hipExtStreamPendingCount() returns to user code.
+//
+// Side effect: increments g_depth_bounce_count whenever bouncing.
+bool ShouldBounceForDepth(amd::HostQueue* q) {
+  if (q == nullptr) return false;
+  const uint64_t cap = StreamDepthMaxPending();
+  if (cap == 0) return false;  // axis disabled
+  if (uint64_t(q->PendingCount()) >= cap) {
+    g_depth_bounce_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+// ================================================================================================
 // V17.5 firewall — public-API implementations.
 // (Already inside the master `namespace hip { ... }` opened at line 42.)
 // ================================================================================================
@@ -868,6 +926,18 @@ static void FirewallDumperLoop(std::string base_dir, uint32_t period_ms) {
                    (unsigned long long)HostInflightBytes());
       std::fprintf(f, "  \"host_budget_limit\": %llu,\n",
                    (unsigned long long)HostBudgetLimitBytes());
+      // V17.5-rc4: per-axis bounce counters for verify-and-fix loop.
+      std::fprintf(f, "  \"bounce_cgroup\": %llu,\n",
+                   (unsigned long long)g_cgroup_reject_count.load(
+                       std::memory_order_relaxed));
+      std::fprintf(f, "  \"bounce_degraded\": %llu,\n",
+                   (unsigned long long)g_degraded_bounce_count.load(
+                       std::memory_order_relaxed));
+      std::fprintf(f, "  \"bounce_depth\": %llu,\n",
+                   (unsigned long long)g_depth_bounce_count.load(
+                       std::memory_order_relaxed));
+      std::fprintf(f, "  \"depth_cap\": %llu,\n",
+                   (unsigned long long)StreamDepthMaxPending());
       std::fprintf(f, "  \"devices\": [\n");
       bool first_dev = true;
       for (size_t d = 0; d < g_devices.size(); ++d) {
@@ -1683,6 +1753,17 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
     // large BAR or coherent memory.
     ihipHtoHMemcpy(dst, src, sizeBytes, stream);
     return hipSuccess;
+  }
+
+  // V17.5-rc4 Group D: depth-axis bounce. Fires only when
+  // HIP_STREAM_DEPTH_MAX_PENDING > 0 and the stream's pending_count_
+  // is at-or-above the cap. Returns hipErrorNotReady so customer code
+  // takes the same back-pressure path as the degraded gate.
+  if (ShouldBounceForDepth(&stream)) {
+    if (pageableCopyAccounted) {
+      GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
+    }
+    return hipErrorNotReady;
   }
 
   if (srcMemory == nullptr && dstMemory == nullptr) {
@@ -4453,6 +4534,11 @@ hipError_t ihipMemset(void* dst, int64_t value, size_t valueSize, size_t sizeByt
       hip_error = hipErrorNotReady;
       break;
     }
+    // V17.5-rc4 Group D: same depth-axis bounce as the memcpy path.
+    if (ShouldBounceForDepth(hip_stream)) {
+      hip_error = hipErrorNotReady;
+      break;
+    }
 
     hip_error = ihipMemsetCommand(commands, dst, value, valueSize, sizeBytes, hip_stream);
     if (hip_error != hipSuccess) {
@@ -4637,6 +4723,10 @@ hipError_t ihipMemset3D(hipPitchedPtr pitchedDevPtr, int value, hipExtent extent
   // V17.5-rc4 Group B: same time-windowed bounce gate as the 1D path.
   if (hip_stream != nullptr &&
       ShouldBounceForDegraded(hip_stream->device().devices()[0])) {
+    return hipErrorNotReady;
+  }
+  // V17.5-rc4 Group D: same depth-axis bounce as the 1D path.
+  if (ShouldBounceForDepth(hip_stream)) {
     return hipErrorNotReady;
   }
 
