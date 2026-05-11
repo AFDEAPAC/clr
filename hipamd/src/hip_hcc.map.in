@@ -590,3 +590,16 @@ global:
 local:
     *;
 } hip_6.2;
+
+# V17.5-rc5 (delivery/v17.5-firewall) — error-class disambiguation API.
+# Lets apps distinguish pre-submission firewall reject (SAFE_RETRY,
+# buffers are safe to free) from post-submission sync timeout
+# (UNSAFE_RETRY, work may still be in flight). Sim / torch_service
+# dlsym() this symbol; missing symbol triggers the conservative fallback
+# (always treat as UNSAFE_RETRY -> leak).
+hip_6.5_classify {
+global:
+    hipExtClassifyLastError;
+local:
+    *;
+} hip_6.5_firewall;

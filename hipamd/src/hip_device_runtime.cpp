@@ -668,6 +668,9 @@ hipError_t hipDeviceSynchronize() {
     hip::getCurrentDevice()->SyncAllStreams(kDoWaitForCpu);
   }
   if (hip::getCurrentDevice()->devices()[0]->AwaitDegraded()) {
+    // V17.5-rc5: hipDeviceSynchronize() — same UNSAFE_RETRY semantics as
+    // hipStreamSynchronize. Buffers in flight may still be referenced.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
     HIP_RETURN(hipErrorNotReady);
   }
   HIP_RETURN(hipSuccess);

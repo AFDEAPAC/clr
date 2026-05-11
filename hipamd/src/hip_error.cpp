@@ -390,3 +390,57 @@ hipError_t hipDrvGetErrorString(hipError_t hip_error, const char** errStr)
   }
 }
 } //namespace hip
+
+// ================================================================================================
+// V17.5-rc5: hipExtClassifyLastError — disambiguate transient HIP errors.
+//
+// Background: rc2/rc3 introduced hipErrorNotReady on per-event sync timeout
+// (K-7.2/K-7.4 await-degraded latch). rc4 added three firewall-side bounce
+// axes (host-pin cgroup, degraded-quiesce, per-stream depth) that return
+// the SAME code. App callers cannot distinguish:
+//   (a) pre-submission reject — HSA queue untouched, buffers are safe to
+//       free, retry is a side-effect-free operation; vs.
+//   (b) post-submission timeout — work may still be in flight on the GPU,
+//       freeing buffers is UAF on device, only safe recovery is to leak
+//       buffers or hipDeviceReset().
+//
+// This API returns the per-thread classification CLR set immediately
+// before the most recent transient return. App pattern:
+//
+//   hipError_t rc = hipMemcpyAsync(...);
+//   if (rc != hipSuccess) {
+//     int cls = 0;
+//     hipExtClassifyLastError(&cls);
+//     if (cls == HIP_EXT_ERROR_CLASS_SAFE_RETRY) {
+//       hipFree(dev_buf);      // safe — firewall caught it pre-submit
+//       hipHostFree(host_buf);
+//       return RETRY_LATER;
+//     } else {
+//       // UNSAFE_RETRY: leak buffers, escalate to process restart
+//       return SHUTDOWN_REQUESTED;
+//     }
+//   }
+//
+// Out-of-band: classification is sticky per-thread; the next hipSuccess
+// does NOT clear it (so the app can call this any time before the next
+// transient). Calling this on a fresh thread or after a hipSuccess that
+// stamped a classification returns UNCLASSIFIED.
+//
+// ABI: not part of HipDispatchTable (so no version bump needed). App
+// dlsym's it; missing symbol => app falls back to "always leak" path.
+//
+// Argument: err_class = output pointer. Values:
+//   0 = UNCLASSIFIED   (no transient observed on this thread, or call
+//                       site was not yet annotated by CLR)
+//   1 = SAFE_RETRY     (pre-submission reject; buffers safe to free)
+//   2 = UNSAFE_RETRY   (post-submission timeout; do NOT free buffers)
+//   3 = FATAL          (device lost / illegal addr / launch failure)
+// ================================================================================================
+extern "C" __attribute__((visibility("default")))
+hipError_t hipExtClassifyLastError(int* err_class) {
+  if (err_class == nullptr) {
+    return hipErrorInvalidValue;
+  }
+  *err_class = hip::GetLastErrorClass();
+  return hipSuccess;
+}

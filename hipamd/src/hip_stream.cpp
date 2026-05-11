@@ -378,6 +378,11 @@ hipError_t hipStreamSynchronize_common(hipStream_t stream) {
   // hipStreamSynchronize starts succeeding again without operator
   // intervention.
   if (hip_stream->device().AwaitDegraded()) {
+    // V17.5-rc5: post-submission sync timeout. Stream had work in flight
+    // when the K-7.2 deadline tripped; that work may still be touching
+    // buffers the caller is about to free. UNSAFE_RETRY — caller MUST
+    // leak buffers or hipDeviceReset(); a hipFree here is UAF on device.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
     return hipErrorNotReady;
   }
   return hipSuccess;
@@ -531,6 +536,9 @@ hipError_t hipStreamQuery_common(hipStream_t stream) {
   hip::Stream* hip_stream = hip::getStream(stream, wait);
 
   if (hip_stream->device().AwaitDegraded()) {
+    // V17.5-rc5: hipStreamQuery on a degraded stream; in-flight work is
+    // ambiguous. UNSAFE_RETRY — same reasoning as hipStreamSynchronize.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
     return hipErrorNotReady;
   }
 

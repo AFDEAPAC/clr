@@ -474,6 +474,10 @@ static hipError_t GuardBeforeAlloc(const ServiceGuardConfig& cfg,
                 (unsigned long long)(bytes >> 20),
                 (unsigned long long)(cfg.cgroup_reserve_bytes >> 20));
         g_cgroup_reject_count.fetch_add(1, std::memory_order_relaxed);
+        // V17.5-rc5: pre-submission reject. We never touched any device
+        // buffer (this rejects the allocation itself). Caller may safely
+        // retry; this is the canonical SAFE_RETRY case.
+        hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_SAFE_RETRY);
         return hipErrorOutOfMemory;
       }
     }
@@ -487,7 +491,12 @@ static hipError_t GuardBeforeAlloc(const ServiceGuardConfig& cfg,
           (cfg.burst_bytes * 1000000000ULL) / cfg.rate_bytes_per_s;
       uint64_t now = NowNs();
       uint64_t old = next_token_ns->load(std::memory_order_relaxed);
-      if (old > now + burst_ns) return hipErrorOutOfMemory;
+      if (old > now + burst_ns) {
+        // V17.5-rc5: burst-token rate-limit exceeded; alloc never touched
+        // the device. SAFE_RETRY.
+        hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_SAFE_RETRY);
+        return hipErrorOutOfMemory;
+      }
       uint64_t base = old > now ? old : now;
       if (!next_token_ns->compare_exchange_weak(old, base + token_ns,
                                                 std::memory_order_relaxed))
@@ -499,6 +508,9 @@ static hipError_t GuardBeforeAlloc(const ServiceGuardConfig& cfg,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   } while (NowNs() < deadline_ns);
 
+  // V17.5-rc5: counter-budget exhausted (host-pin cgroup or vram budget);
+  // alloc never touched the device. SAFE_RETRY.
+  hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_SAFE_RETRY);
   return hipErrorOutOfMemory;
 }
 
@@ -1140,6 +1152,9 @@ hipError_t ihipFree(void *ptr) {
     // Wait on the device, associated with the current memory object during allocation
     auto device_id = memory_object->getUserData().deviceId;
     if (FreeRejectOnActive() && g_devices[device_id]->existsActiveStreamForDevice()) {
+      // V17.5-rc5: the buffer being freed has an active stream — work
+      // may still touch it. UNSAFE to assume free took effect.
+      hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
       return hipErrorNotReady;
     }
     const uint64_t sync_start_ns = NowNs();
@@ -1154,6 +1169,8 @@ hipError_t ihipFree(void *ptr) {
       ClPrint(amd::LOG_WARNING, amd::LOG_API,
               "hipFree: deferred free for %p (device %d), queue size %zu",
               ptr, device_id, qsz);
+      // V17.5-rc5: deferred free; sync did not drain. UNSAFE_RETRY.
+      hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
       return hipErrorNotReady;
     }
     // K-7.8 V17.5 (CONCERN-4): hipFree intentionally remains permissive
@@ -1745,6 +1762,9 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
       // DtoH: need to map GPU memory, read via BAR, copy to host
       // For now, return error for DtoH — GPU read via BAR is complex
       // and DtoH doesn't cause the deadlock (it's the H2D that does)
+      // V17.5-rc5: pre-submission reject (degraded latch fired before we
+      // touched HSA queue). dst/src buffers are unchanged. SAFE_RETRY.
+      hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_SAFE_RETRY);
       return hipErrorNotReady;
     }
     // Pageable H2D: copy via CPU memcpy to device-visible host memory
@@ -1763,6 +1783,9 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
     if (pageableCopyAccounted) {
       GuardAfterFree(g_pageable_copy_inflight, sizeBytes);
     }
+    // V17.5-rc5: pre-submission reject (depth cap hit before HSA queue
+    // was touched). dst/src buffers are unchanged. SAFE_RETRY.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_SAFE_RETRY);
     return hipErrorNotReady;
   }
 
@@ -1836,6 +1859,12 @@ hipError_t ihipMemcpy(void* dst, const void* src, size_t sizeBytes, hipMemcpyKin
   // enqueue and return, so a stale latch from a prior degraded op is
   // not propagated at submit time.
   if (!isHostAsync && stream.device().AwaitDegraded()) {
+    // V17.5-rc5: POST-submission timeout — we already enqueued the
+    // command and ran finish() above. The deadline tripped, which means
+    // the GPU work may still be in flight. Freeing dst/src now would be
+    // UAF on device. Caller MUST not free; safe action is process exit
+    // or hipDeviceReset(). UNSAFE_RETRY.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
     return hipErrorNotReady;
   }
   return hipSuccess;

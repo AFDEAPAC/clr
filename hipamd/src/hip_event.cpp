@@ -90,6 +90,10 @@ hipError_t Event::synchronize() {
   // gate), so legacy hipSuccess contract is bit-for-bit preserved with
   // service-survival mode off.
   if (hip_device->devices()[0]->AwaitDegraded()) {
+    // V17.5-rc5: hipEventSynchronize wait timed out on degraded device;
+    // the GPU command associated with this event may still be running.
+    // UNSAFE_RETRY — see hipStreamSynchronize for full reasoning.
+    hip::SetLastErrorClass(hip::HIP_EXT_ERROR_CLASS_UNSAFE_RETRY);
     return hipErrorNotReady;
   }
   return hipSuccess;

@@ -611,12 +611,29 @@ public:
     void WaitActiveStreams(hip::Stream* blocking_stream, bool wait_null_stream = false);
   };
 
+  // V17.5-rc5 (AMD app-side error disambiguation): app needs to know whether
+  // a transient HIP return (hipErrorNotReady / hipErrorOutOfMemory) came from
+  // a pre-submission firewall reject (HSA queue untouched -> buffers safe to
+  // free, retry has no side effect) or from a post-submission sync timeout
+  // (work may still be in flight on the GPU -> freeing buffers is UAF on
+  // device). rc2/rc3 introduced the timeout return without giving apps any
+  // way to disambiguate, which forced sim / app to leak buffers on every
+  // transient. rc5 sets a thread-local classification at every reject site
+  // so the app can call hipExtClassifyLastError() and decide.
+  enum HipExtErrorClass {
+    HIP_EXT_ERROR_CLASS_UNCLASSIFIED = 0,
+    HIP_EXT_ERROR_CLASS_SAFE_RETRY   = 1,  // pre-submission reject; buffers safe; retry is side-effect-free
+    HIP_EXT_ERROR_CLASS_UNSAFE_RETRY = 2,  // post-submission timeout; work may still be in flight; do NOT free buffers
+    HIP_EXT_ERROR_CLASS_FATAL        = 3,  // device-lost / illegal addr / launch failure; not retryable
+  };
+
   /// Thread Local Storage Variables Aggregator Class
   class TlsAggregator {
   public:
     Device* device_;
     std::stack<Device*> ctxt_stack_;
     hipError_t last_error_;
+    int last_error_class_;  // V17.5-rc5: see HipExtErrorClass above
     std::vector<hip::Stream*> capture_streams_;
     hipStreamCaptureMode stream_capture_mode_;
     std::stack<ihipExec_t> exec_stack_;
@@ -624,12 +641,20 @@ public:
 
     TlsAggregator(): device_(nullptr),
       last_error_(hipSuccess),
+      last_error_class_(HIP_EXT_ERROR_CLASS_UNCLASSIFIED),
       stream_capture_mode_(hipStreamCaptureModeGlobal) {
     }
     ~TlsAggregator() {
     }
   };
   extern thread_local TlsAggregator tls;
+
+  // V17.5-rc5: helpers callable from anywhere in CLR to stamp the per-thread
+  // classification just before returning a transient error. Header-inline so
+  // the compiler can fold the TLS access into a single mov on the hot path.
+  inline void SetLastErrorClass(int c) { tls.last_error_class_ = c; }
+  inline int  GetLastErrorClass()      { return tls.last_error_class_; }
+  inline void ClearLastErrorClass()    { tls.last_error_class_ = HIP_EXT_ERROR_CLASS_UNCLASSIFIED; }
 
   /// Device representing the host - for pinned memory
   extern amd::Context* host_context;
